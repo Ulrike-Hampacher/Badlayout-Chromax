@@ -1,21 +1,3 @@
-Verstanden: W1 und W2 sind nicht immer „fixe Wasserbäder“, sondern können optional als „R-Stationen“ (Reagenzstationen) genutzt werden. Dann dürfen sie nicht mehr WATER-Klasse erzwingen.
-
-Ich ändere die Logik so:
-	•	W3–W5 bleiben immer WATER (BLOCK wenn nicht WATER).
-	•	W1–W2 sind „Mode-switch“:
-	•	Mode = WATER → muss WATER-Klasse enthalten
-	•	Mode = REAGENT → darf jede Reagenzklasse enthalten (wie R-Station)
-	•	UI: neben dem Layout gibt’s einen kleinen Schalter W1/W2 Mode: WATER/REAGENT
-	•	Check-Regeln berücksichtigen das:
-	•	Wenn ein Schritt „rinse/wash/water“ auf W1 oder W2 liegt, dann muss W1/W2 Mode = WATER sein, sonst BLOCK.
-	•	Wenn W1/W2 Mode = REAGENT, dann gelten für W1/W2 die gleichen Klassenregeln wie bei R-Slots.
-
-Hier ist der Patch als kompletter neuer app.py (damit du nicht wieder in Klammer-Fehler läufst). Du kannst den von der letzten Version 1:1 ersetzen.
-
-⸻
-
-✅ Neuer kompletter app.py (mit W1/W2 umschaltbar)
-
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
