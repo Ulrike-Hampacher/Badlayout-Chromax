@@ -5,59 +5,51 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-app = FastAPI(title="CHROMAX ST Demo Device (Badlayout)")
+app = FastAPI(title="CHROMAX ST Demo (Badlayout)")
 
-# ----------------------------
+# =========================================================
 # Helpers
-# ----------------------------
-def now():
+# =========================================================
+def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def ampel(overall: Optional[str]) -> str:
     return {"OK": "🟢 OK", "WARN": "🟡 WARN", "BLOCK": "🔴 BLOCK"}.get(overall or "", "⚪ (no check)")
 
-# ----------------------------
-# Rules with codes
-# ----------------------------
-RULES: Dict[str, Any] = {
-    "rules": [
-        {"id": "R-ST-SLIDE-LIMIT",
-         "then": {"code": "E101", "require_max": {"field": "slides_loaded", "max_from_field": "max_slides_supported"},
-                  "level": "BLOCK", "message": "Maximale Objektträgerzahl überschritten."}},
-        {"id": "R-ST-SLIDE-HIGH",
-         "then": {"code": "W201", "warn_if_greater": {"field": "slides_loaded", "threshold": 50},
-                  "level": "WARN", "message": "Hohe Objektträgerzahl: mögliches QC-Risiko."}},
-        {"id": "R-ST-TEMP-RANGE",
-         "then": {"code": "E103", "require_range": {"field": "temperature_c", "min": 15, "max": 30},
-                  "level": "BLOCK", "message": "Betriebstemperatur außerhalb 15–30°C."}},
-
-        # H&E sequence rule (Demo)
-        {"id": "R-ST-SEQ-HE", "when": {"protocol_type": "H&E"},
-         "then": {"code": "E201", "must_contain_order": {"sequence": ["deparaffinization","hematoxylin","rinse","eosin","dehydrate","clear"]},
-                  "level": "BLOCK", "message": "Ungültige oder unvollständige H&E-Schrittfolge."}},
-
-        {"id": "R-ST-REQ-RINSE",
-         "then": {"code": "E202", "require_step": {"name": "rinse"},
-                  "level": "BLOCK", "message": "Pflichtschritt fehlt: rinse."}},
-
-        {"id": "R-ST-HEMA-TIME", "when": {"protocol_type": "H&E"},
-         "then": {"code": "W202", "step_time_range": {"step": "hematoxylin", "min": 120, "max": 300},
-                  "level": "WARN", "message": "Hematoxylin-Zeit außerhalb 120–300s."}},
-
-        {"id": "R-ST-REAGENT-MIN",
-         "then": {"code": "E301", "reagent_minimum": True,
-                  "level": "BLOCK", "message": "Mindestens ein Reagenz unter Mindestfüllstand."}},
-    ]
-}
 SEVERITY = {"OK": 1, "WARN": 2, "BLOCK": 3}
 
-# ----------------------------
-# Models
-# ----------------------------
+def bump_overall(current: str, new_level: str) -> str:
+    return new_level if SEVERITY[new_level] > SEVERITY[current] else current
+
+# =========================================================
+# Device-like layout model (schematic, not IFU copy)
+# =========================================================
+# U-shape:
+# Top row:    IN -> OVEN -> S1..S9 -> WATER
+# Bottom row: S18..S10 -> OUT
+STATIONS_TOP = [{"id": "IN", "label": "IN", "type": "input"},
+                {"id": "OVEN", "label": "OVEN", "type": "oven"}] + \
+               [{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(1, 10)] + \
+               [{"id": "W1", "label": "WATER", "type": "water"}]
+
+STATIONS_BOTTOM = [{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(18, 9, -1)] + \
+                  [{"id": "OUT", "label": "OUT", "type": "output"}]
+
+# Process path order for evaluation (IN/OUT are transport only)
+PATH = ["OVEN"] + [f"S{i}" for i in range(1, 19)] + ["W1"]
+
+STATION_TYPE: Dict[str, str] = {}
+for s in STATIONS_TOP + STATIONS_BOTTOM:
+    STATION_TYPE[s["id"]] = s["type"]
+
+# =========================================================
+# Protocol / step model
+# =========================================================
 @dataclass
 class Step:
     name: str
     time_sec: int
+    station_id: str
 
 @dataclass
 class Reagent:
@@ -68,7 +60,6 @@ class Reagent:
 class RunInput:
     run_id: str
     protocol_type: str
-    run_state: str
     slides_loaded: int
     max_slides_supported: int
     temperature_c: float
@@ -79,250 +70,248 @@ def run_to_dict(run: RunInput) -> Dict[str, Any]:
     return {
         "run_id": run.run_id,
         "protocol_type": run.protocol_type,
-        "run_state": run.run_state,
         "slides_loaded": run.slides_loaded,
         "max_slides_supported": run.max_slides_supported,
         "temperature_c": run.temperature_c,
-        "steps": [{"name": s.name, "time_sec": s.time_sec} for s in run.steps],
+        "steps": [{"station": s.station_id, "name": s.name, "time_sec": s.time_sec} for s in run.steps],
         "reagents": {k: {"volume_ml": v.volume_ml, "min_required_ml": v.min_required_ml} for k, v in run.reagents.items()},
     }
 
-def steps_list(run_dict: Dict[str, Any]) -> List[str]:
+def steps_list_in_path_order(run_dict: Dict[str, Any]) -> List[str]:
+    # Steps already collected in PATH order by builder, so keep order as is.
     return [s["name"] for s in run_dict["steps"]]
 
+# =========================================================
+# Rules (device-ish)
+# =========================================================
+# Step -> required station type (simple compatibility layer)
+# You can extend this mapping to match the real device constraints.
+STEP_REQUIRED_TYPE = {
+    "rinse": "water",
+    "water": "water",
+    "oven": "oven",
+    # Most chemistry steps assumed in "bath"
+    "deparaffinization": "bath",
+    "hematoxylin": "bath",
+    "eosin": "bath",
+    "dehydrate": "bath",
+    "clear": "bath",
+}
+
 def evaluate(run: RunInput) -> Dict[str, Any]:
-    run_dict = run_to_dict(run)
+    rd = run_to_dict(run)
     findings: List[Dict[str, Any]] = []
-
-    for rule in RULES["rules"]:
-        rid = rule["id"]
-        when = rule.get("when", {})
-        then = rule["then"]
-
-        if any(run_dict.get(k) != v for k, v in when.items()):
-            continue
-
-        code = then.get("code", "X000")
-        level = then["level"]
-        msg = then["message"]
-
-        if "require_range" in then:
-            f = then["require_range"]["field"]
-            mn = float(then["require_range"]["min"])
-            mx = float(then["require_range"]["max"])
-            val = float(run_dict[f])
-            if not (mn <= val <= mx):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"field": f, "min": mn, "max": mx, "actual": val}})
-                continue
-
-        if "require_max" in then:
-            f = then["require_max"]["field"]
-            mf = then["require_max"]["max_from_field"]
-            val = int(run_dict[f]); mx = int(run_dict[mf])
-            if val > mx:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"field": f, "max": mx, "actual": val}})
-                continue
-
-        if "warn_if_greater" in then:
-            f = then["warn_if_greater"]["field"]
-            th = float(then["warn_if_greater"]["threshold"])
-            val = float(run_dict[f])
-            if val > th:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"field": f, "threshold": th, "actual": val}})
-                continue
-
-        if "must_contain_order" in then:
-            required = then["must_contain_order"]["sequence"]
-            actual = steps_list(run_dict)
-            idx = -1
-            ok = True
-            for step in required:
-                if step not in actual or actual.index(step) <= idx:
-                    ok = False
-                    break
-                idx = actual.index(step)
-            if not ok:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"required_sequence": required, "actual": actual}})
-            continue
-
-        if "require_step" in then:
-            need = then["require_step"]["name"]
-            if need not in steps_list(run_dict):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"missing_step": need}})
-                continue
-
-        if "step_time_range" in then:
-            name = then["step_time_range"]["step"]
-            mn = int(then["step_time_range"]["min"])
-            mx = int(then["step_time_range"]["max"])
-            t = next((s["time_sec"] for s in run_dict["steps"] if s["name"] == name), None)
-            if t is None or not (mn <= int(t) <= mx):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"step": name, "min": mn, "max": mx, "actual": t}})
-                continue
-
-        if then.get("reagent_minimum"):
-            below = []
-            for name, r in run_dict["reagents"].items():
-                if float(r["volume_ml"]) < float(r["min_required_ml"]):
-                    below.append({"reagent": name, "volume_ml": r["volume_ml"], "min_required_ml": r["min_required_ml"]})
-            if below:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
-                                 "details": {"below_min": below}})
-                continue
-
     overall = "OK"
-    for f in findings:
-        if SEVERITY[f["level"]] > SEVERITY[overall]:
-            overall = f["level"]
+
+    # ---- Basic capacity / environment checks
+    if rd["slides_loaded"] > rd["max_slides_supported"]:
+        findings.append({"code": "E101", "level": "BLOCK", "message": "Maximale Objektträgerzahl überschritten.",
+                         "details": {"slides_loaded": rd["slides_loaded"], "max_slides_supported": rd["max_slides_supported"]}})
+        overall = bump_overall(overall, "BLOCK")
+
+    if rd["slides_loaded"] > 50:
+        findings.append({"code": "W201", "level": "WARN", "message": "Hohe Objektträgerzahl: mögliches QC-Risiko.",
+                         "details": {"slides_loaded": rd["slides_loaded"], "threshold": 50}})
+        overall = bump_overall(overall, "WARN")
+
+    if not (15 <= float(rd["temperature_c"]) <= 30):
+        findings.append({"code": "E103", "level": "BLOCK", "message": "Betriebstemperatur außerhalb 15–30°C.",
+                         "details": {"temperature_c": rd["temperature_c"], "min": 15, "max": 30}})
+        overall = bump_overall(overall, "BLOCK")
+
+    # ---- Reagent minimum
+    below = []
+    for name, r in rd["reagents"].items():
+        if float(r["volume_ml"]) < float(r["min_required_ml"]):
+            below.append({"reagent": name, "volume_ml": r["volume_ml"], "min_required_ml": r["min_required_ml"]})
+    if below:
+        findings.append({"code": "E301", "level": "BLOCK", "message": "Mindestens ein Reagenz unter Mindestfüllstand.",
+                         "details": {"below_min": below}})
+        overall = bump_overall(overall, "BLOCK")
+
+    # ---- Station type compatibility (device layout vs step)
+    for s in rd["steps"]:
+        step_name = s["name"]
+        station_id = s["station"]
+        required = STEP_REQUIRED_TYPE.get(step_name)
+        actual_type = STATION_TYPE.get(station_id, "unknown")
+        if required and actual_type != required:
+            findings.append({
+                "code": "E402",
+                "level": "BLOCK",
+                "message": "Schritt auf falschem Stationstyp (Layout inkompatibel).",
+                "details": {"step": step_name, "station": station_id, "station_type": actual_type, "required_type": required}
+            })
+            overall = bump_overall(overall, "BLOCK")
+
+    # ---- Protocol logic checks (H&E demo)
+    step_names = steps_list_in_path_order(rd)
+
+    # must contain rinse somewhere
+    if "rinse" not in step_names:
+        findings.append({"code": "E202", "level": "BLOCK", "message": "Pflichtschritt fehlt: rinse.",
+                         "details": {"missing_step": "rinse"}})
+        overall = bump_overall(overall, "BLOCK")
+
+    if rd["protocol_type"] == "H&E":
+        required_seq = ["deparaffinization", "hematoxylin", "rinse", "eosin", "dehydrate", "clear"]
+        idx = -1
+        ok = True
+        for step in required_seq:
+            if step not in step_names:
+                ok = False
+                break
+            pos = step_names.index(step)
+            if pos <= idx:
+                ok = False
+                break
+            idx = pos
+        if not ok:
+            findings.append({"code": "E201", "level": "BLOCK", "message": "Ungültige oder unvollständige H&E-Schrittfolge.",
+                             "details": {"required_sequence": required_seq, "actual": step_names}})
+            overall = bump_overall(overall, "BLOCK")
+
+        # hematoxylin time range warning
+        hema_time = None
+        for st in rd["steps"]:
+            if st["name"] == "hematoxylin":
+                hema_time = int(st["time_sec"])
+                break
+        if hema_time is None or not (120 <= hema_time <= 300):
+            findings.append({"code": "W202", "level": "WARN", "message": "Hematoxylin-Zeit außerhalb 120–300s.",
+                             "details": {"step": "hematoxylin", "min": 120, "max": 300, "actual": hema_time}})
+            overall = bump_overall(overall, "WARN")
 
     return {"run_id": run.run_id, "overall": overall, "findings": findings}
 
-# ----------------------------
-# Device singleton (super simple)
-# ----------------------------
+# =========================================================
+# Device state (simple)
+# =========================================================
 class Device:
     def __init__(self):
-        self.state = "READY"
         self.operator: Optional[str] = None
         self.last_result: Optional[Dict[str, Any]] = None
         self.audit: List[Dict[str, Any]] = []
+        self.log("BOOT", {})
 
-    def log(self, event, details=None):
-        self.audit.append({"t": now(), "event": event, "details": details or {}, "operator": self.operator, "state": self.state})
+    def log(self, event: str, details: Dict[str, Any]):
+        self.audit.append({"t": now(), "event": event, "details": details})
 
-    def status(self):
+    def status(self) -> Dict[str, Any]:
         return {
-            "state": self.state,
             "operator": self.operator,
             "overall": self.last_result["overall"] if self.last_result else None,
             "findings": len(self.last_result["findings"]) if self.last_result else None,
         }
 
-device = Device()
-device.log("BOOT")
+dev = Device()
 
-# ----------------------------
-# API payload for Badlayout test
-# ----------------------------
+# =========================================================
+# API models
+# =========================================================
 class LayoutTestReq(BaseModel):
     protocol_type: str = "H&E"
     slides_loaded: int = 48
     max_slides_supported: int = 60
     temperature_c: float = 22.0
-    baths: List[Dict[str, Any]]  # [{station:1, step:"hematoxylin", time_sec:180}, ...]
-    reagents: Dict[str, Dict[str, float]]  # {"hematoxylin":{"volume_ml":350,"min_required_ml":300}, ...}
+    # baths: list of {station: "S1", step: "hematoxylin", time_sec: 180}
+    baths: List[Dict[str, Any]]
+    # reagents: {"hematoxylin":{"volume_ml":350,"min_required_ml":300}, ...}
+    reagents: Dict[str, Dict[str, float]]
 
 @app.post("/api/test_layout")
 def api_test_layout(req: LayoutTestReq):
-    steps = []
+    steps: List[Step] = []
     for b in req.baths:
-        name = (b.get("step") or "").strip()
-        t = int(b.get("time_sec") or 0)
-        if name and name != "none" and t > 0:
-            steps.append(Step(name=name, time_sec=t))
+        station = (b.get("station") or "").strip()
+        step = (b.get("step") or "").strip()
+        time_sec = int(b.get("time_sec") or 0)
+        if station in STATION_TYPE and step and step != "none" and time_sec > 0:
+            steps.append(Step(name=step, time_sec=time_sec, station_id=station))
 
-    reagents = {}
-    for k, v in req.reagents.items():
-        reagents[k] = Reagent(volume_ml=float(v.get("volume_ml", 0)), min_required_ml=float(v.get("min_required_ml", 0)))
+    reagents: Dict[str, Reagent] = {}
+    for name, rv in req.reagents.items():
+        reagents[name] = Reagent(volume_ml=float(rv.get("volume_ml", 0.0)),
+                                 min_required_ml=float(rv.get("min_required_ml", 0.0)))
 
     run = RunInput(
         run_id="RUN-BADLAYOUT",
         protocol_type=req.protocol_type,
-        run_state="READY",
         slides_loaded=int(req.slides_loaded),
         max_slides_supported=int(req.max_slides_supported),
         temperature_c=float(req.temperature_c),
         steps=steps,
-        reagents=reagents
+        reagents=reagents,
     )
+
     result = evaluate(run)
-    device.last_result = result
-    device.log("TEST_LAYOUT", {"overall": result["overall"], "n": len(result["findings"])})
+    dev.last_result = result
+    dev.log("TEST_LAYOUT", {"overall": result["overall"], "n": len(result["findings"])})
     return result
 
-# ----------------------------
-# Pages
-# ----------------------------
+@app.get("/api/audit", response_class=JSONResponse)
+def api_audit():
+    return dev.audit[-300:]
+
+# =========================================================
+# Pages (NO f-strings with curly braces)
+# Use placeholders + replace to avoid SyntaxError from { } in CSS/JS.
+# =========================================================
 @app.get("/", response_class=HTMLResponse)
 def home():
-    st = device.status()
-    html = f"""
-    <html><head>
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>CHROMAX ST Demo</title>
-      <style>
-        body {{ font-family: -apple-system, Arial; padding: 16px; }}
-        .card {{ border:1px solid #ddd; border-radius: 14px; padding: 14px; margin: 12px 0; }}
-        a.button {{ display:inline-block; padding:10px 12px; border:1px solid #ccc; border-radius:12px; text-decoration:none; margin-right:8px; }}
-        .mono {{ font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; }}
-      </style>
-    </head>
-    <body>
-      <h2>CHROMAX ST (DEMO)</h2>
-      <div class="card">
-        <div><b>STATE</b>: {st["state"]}</div>
-        <div><b>OPERATOR</b>: {st["operator"] or "-"}</div>
-        <div><b>CHECK</b>: {ampel(st["overall"])}</div>
-        <div><b>FINDINGS</b>: {st["findings"] if st["findings"] is not None else "-"}</div>
-      </div>
+    st = dev.status()
+    tpl = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CHROMAX ST Demo</title>
+  <style>
+    body{font-family:-apple-system,system-ui,Arial;margin:0;padding:18px;background:#0b1220;color:#eaf0ff;}
+    .card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:14px;margin:12px 0;}
+    .pill{display:inline-flex;gap:10px;align-items:center;padding:10px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);}
+    a{color:#7aa2ff;text-decoration:none;}
+    .btn{display:inline-block;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.06);color:#eaf0ff;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="pill"><b>CHROMAX ST</b> <span style="opacity:.7">(DEMO)</span></div>
+    <div style="margin-top:10px;opacity:.85">Operator: <b>__OP__</b></div>
+    <div style="margin-top:6px;opacity:.85">Check: <b>__CHECK__</b> &nbsp;&nbsp; Findings: <b>__N__</b></div>
+  </div>
 
-      <div class="card">
-        <h3>Badlayout</h3>
-        <a class="button" href="/layout">Open Badlayout Screen</a>
-        <a class="button" href="/audit">Audit</a>
-        <a class="button" href="/last">Last Result</a>
-      </div>
+  <div class="card">
+    <a class="btn" href="/layout">Open Badlayout Screen</a>
+    <a class="btn" href="/audit">Audit</a>
+    <a class="btn" href="/last">Last Result</a>
+  </div>
 
-      <div class="card">
-        <div class="mono">
-Tipp: Im Badlayout Screen kannst du pro Station Schritt + Zeit einstellen,
-Reagenzien füllen und dann CHECK drücken.
-        </div>
-      </div>
-    </body></html>
-    """
-    return html
+  <div class="card" style="opacity:.8">
+    Tipp: Im Badlayout Screen Stationen belegen (OVEN/S1..S18/WATER) und dann CHECK drücken.
+  </div>
+</body>
+</html>
+"""
+    html = tpl.replace("__OP__", st["operator"] or "-") \
+              .replace("__CHECK__", ampel(st["overall"])) \
+              .replace("__N__", str(st["findings"]) if st["findings"] is not None else "-")
+    return HTMLResponse(html)
 
-@app.get("/last", response_class=HTMLResponse)
+@app.get("/last", response_class=PlainTextResponse)
 def last():
-    res = device.last_result or {"overall": None, "findings": []}
-    return HTMLResponse(f"<pre>{res}</pre>")
+    return PlainTextResponse(str(dev.last_result or {"overall": None, "findings": []}))
 
 @app.get("/audit", response_class=PlainTextResponse)
 def audit():
-    lines = []
-    for e in device.audit[-200:]:
-        lines.append(f"{e['t']} | {e['event']} | state={e['state']} | {e['details']}")
-    return "\n".join(lines)
+    lines = ["AUDIT (last 300)"]
+    for e in dev.audit[-300:]:
+        lines.append(f"{e['t']} | {e['event']} | {e['details']}")
+    return PlainTextResponse("\n".join(lines))
 
 @app.get("/layout", response_class=HTMLResponse)
 def layout():
-    # Gerät-nahes, schematisches Layout (U-Form), keine IFU-Kopie.
-    # Oben:  IN -> OVEN -> S1..S9 -> WATER
-    # U-turn
-    # Unten: S18..S10 -> OUT
-
-    stations_top = [
-        {"id": "IN", "label": "IN", "type": "input"},
-        {"id": "OVEN", "label": "OVEN", "type": "oven"},
-        *[{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(1, 10)],
-        {"id": "W1", "label": "WATER", "type": "water"},
-    ]
-    stations_bottom = [
-        *[{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(18, 9, -1)],
-        {"id": "OUT", "label": "OUT", "type": "output"},
-    ]
-
-    # Traversal order for rules evaluation (the "process path")
-    path = ["OVEN"] + [f"S{i}" for i in range(1, 19)] + ["W1"]
-    # IN/OUT are not process steps, they’re transport I/O.
-
+    # Build station tiles (HTML chunks)
     step_options = [
         "none",
         "deparaffinization",
@@ -332,465 +321,393 @@ def layout():
         "dehydrate",
         "clear",
         "custom_step",
+        "oven",
+        "water",
     ]
-    opts_html = "".join([f"<option value='{s}'>{s}</option>" for s in step_options])
+    opts = "".join([f"<option value='{s}'>{s}</option>" for s in step_options])
 
-    # Default reagents (you can extend later)
-    default_reagents = {
-        "hematoxylin": {"volume_ml": 350, "min_required_ml": 300},
-        "eosin": {"volume_ml": 450, "min_required_ml": 300},
-    }
+    def tile(st: Dict[str, str]) -> str:
+        sid = st["id"]
+        typ = st["type"]
+        label = st["label"]
+        # transport I/O no inputs
+        if typ in ("input", "output"):
+            return (
+                f"<div class='tile {typ}' id='tile_{sid}'>"
+                f"<div class='title'>{label}</div>"
+                f"<div class='sub'>I/O</div>"
+                f"</div>"
+            )
+        # process stations with step + time
+        return (
+            f"<div class='tile {typ}' id='tile_{sid}'>"
+            f"<div class='title'>{label}</div>"
+            f"<select id='step_{sid}' class='sel'>{opts}</select>"
+            f"<div class='row'><span class='muted'>Zeit (s)</span>"
+            f"<input id='time_{sid}' class='num wide' type='number' value='0'></div>"
+            f"</div>"
+        )
 
-    reagent_rows = ""
-    for name, r in default_reagents.items():
-        reagent_rows += f"""
-        <div class="reagent-row">
-          <div class="rname"><b>{name}</b></div>
-          <div>vol <input type="number" id="r_{name}_vol" value="{r['volume_ml']}" class="num"> ml</div>
-          <div>min <input type="number" id="r_{name}_min" value="{r['min_required_ml']}" class="num"> ml</div>
-        </div>
-        """
+    top_html = "".join([tile(s) for s in STATIONS_TOP])
+    bottom_html = "".join([tile(s) for s in STATIONS_BOTTOM])
 
-    def station_tile(st):
-        # IN/OUT: no step/time
-        if st["type"] in ("input", "output"):
-            return f"""
-            <div class="tile {st['type']}" id="tile_{st['id']}">
-              <div class="title">{st['label']}</div>
-              <div class="sub">I/O</div>
-            </div>
-            """
-        # OVEN/WATER/BATH: step/time allowed
-        return f"""
-        <div class="tile {st['type']}" id="tile_{st['id']}">
-          <div class="title">{st['label']}</div>
-          <select id="step_{st['id']}" class="sel">{opts_html}</select>
-          <div class="row">
-            <span class="muted">Zeit (s)</span>
-            <input type="number" id="time_{st['id']}" value="0" class="num wide">
-          </div>
-        </div>
-        """
+    # PATH JS literal
+    path_js = "[" + ",".join([f"'{p}'" for p in PATH]) + "]"
 
-    top_html = "".join([station_tile(s) for s in stations_top])
-    bottom_html = "".join([station_tile(s) for s in stations_bottom])
+    tpl = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Badlayout</title>
+  <style>
+  :root{
+    --bg:#0b1220;
+    --card:rgba(255,255,255,.05);
+    --stroke:rgba(255,255,255,.10);
+    --text:#eaf0ff;
+    --muted:#9fb0d0;
+    --accent:#7aa2ff;
+    --ok:#2ecc71;
+    --warn:#f1c40f;
+    --block:#e74c3c;
+    --shadow:0 10px 30px rgba(0,0,0,.35);
+    --radius:16px;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;padding:18px;color:var(--text);
+    font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;
+    background:
+      radial-gradient(1200px 800px at 20% 0%, rgba(122,162,255,.20), transparent 55%),
+      radial-gradient(1000px 700px at 80% 20%, rgba(46,204,113,.12), transparent 60%),
+      var(--bg);
+  }
+  a{color:var(--accent);text-decoration:none;}
+  .header{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px;}
+  .h-title{font-weight:900;letter-spacing:.4px;font-size:18px;}
+  .pill{display:inline-flex;align-items:center;gap:10px;padding:10px 12px;border-radius:999px;border:1px solid var(--stroke);background:rgba(255,255,255,.04);}
+  .badge{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;border:1px solid var(--stroke);background:rgba(255,255,255,.04);color:var(--muted);}
+  .status-ok{border-color:rgba(46,204,113,.35);background:rgba(46,204,113,.10);color:var(--ok);}
+  .status-warn{border-color:rgba(241,196,15,.35);background:rgba(241,196,15,.10);color:var(--warn);}
+  .status-block{border-color:rgba(231,76,60,.35);background:rgba(231,76,60,.10);color:var(--block);}
 
-    # JS arrays as literals
-    path_js = "[" + ",".join([f"'{p}'" for p in path]) + "]"
+  .grid{display:grid;grid-template-columns:1fr;gap:12px;}
+  @media (min-width: 860px){ .grid{grid-template-columns: 1.2fr .8fr;} }
 
-    html = f"""
-    <html><head>
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>Badlayout (Device-like)</title>
-      <style>
-        body {{ font-family:-apple-system, Arial; padding: 14px; }}
-        .card {{ border:1px solid #ddd; border-radius:14px; padding:14px; margin:12px 0; }}
-        .topbar {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
-        .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; }}
-        .layout {{ overflow-x:auto; }}
-        .rowgrid {{
-          display:grid;
-          grid-auto-flow: column;
-          grid-auto-columns: 150px;
-          gap:10px;
-          padding: 10px 0;
-          align-items: start;
-        }}
-        .tile {{
-          border:1px solid #e5e5e5;
-          border-radius:14px;
-          padding:10px;
-          min-height: 140px;
-        }}
-        .title {{ font-weight:800; margin-bottom:8px; }}
-        .sub {{ color:#666; }}
-        .sel {{ width:100%; padding:10px; border-radius:10px; border:1px solid #ccc; }}
-        .row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:8px; }}
-        .muted {{ color:#666; font-size: 13px; }}
-        .num {{ padding:10px; border-radius:10px; border:1px solid #ccc; width:90px; }}
-        .num.wide {{ width:100%; }}
+  .card{background:var(--card);border:1px solid var(--stroke);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;}
+  h3{margin:0 0 10px;font-size:14px;color:var(--muted);font-weight:800;letter-spacing:.3px;}
 
-        /* Station types (neutral, not IFU colors) */
-        .input  {{ background:#fafafa; }}
-        .output {{ background:#fafafa; }}
-        .oven   {{ background:#fff7f7; }}
-        .water  {{ background:#f6fbff; }}
-        .bath   {{ background:#ffffff; }}
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;}
+  .field{min-width:130px;}
+  label{color:var(--muted);font-size:12px;display:block;margin-bottom:6px;}
+  input,select{
+    width:100%;padding:12px 12px;border-radius:14px;border:1px solid var(--stroke);
+    background:rgba(255,255,255,.05);color:var(--text);outline:none;
+  }
+  input:focus,select:focus{border-color:rgba(122,162,255,.55);box-shadow:0 0 0 4px rgba(122,162,255,.12);}
 
-        /* Highlight result */
-        .ok {{ outline: 2px solid #2ecc71; }}
-        .warn {{ outline: 2px solid #f1c40f; }}
-        .block {{ outline: 2px solid #e74c3c; }}
+  .btnbar{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
+  button{
+    border:1px solid var(--stroke);background:rgba(255,255,255,.06);color:var(--text);
+    padding:12px 14px;border-radius:14px;font-weight:800;
+  }
+  button.primary{border-color:rgba(122,162,255,.55);background:rgba(122,162,255,.18);}
+  button.danger{border-color:rgba(231,76,60,.55);background:rgba(231,76,60,.14);}
 
-        .out {{ white-space:pre-wrap; font-family: ui-monospace, Menlo, monospace; }}
-        button {{ padding:12px 14px; border-radius:12px; border:1px solid #ccc; margin-right:8px; }}
-        .reagent-row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid #eee; }}
-        .rname {{ min-width:120px; }}
-      </style>
-    </head>
-    <body>
-      <h2>Badlayout (Device-like U-Shape)</h2>
+  .layout{overflow-x:auto;}
+  .rowgrid{
+    display:grid;
+    grid-auto-flow:column;
+    grid-auto-columns: 150px;
+    gap:10px;
+    padding: 10px 0;
+    align-items:start;
+  }
+  .tile{
+    border:1px solid rgba(255,255,255,.12);
+    border-radius:16px;
+    padding:12px;
+    min-height: 150px;
+    background:rgba(255,255,255,.03);
+  }
+  .tile .title{font-weight:900;margin-bottom:8px;letter-spacing:.2px;}
+  .tile .sub{opacity:.7;}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px;}
+  .muted{color:var(--muted);font-size:12px;}
+  .num{padding:12px;border-radius:14px;border:1px solid var(--stroke);background:rgba(255,255,255,.05);color:var(--text);width:92px;}
+  .num.wide{width:100%;}
+  .sel{width:100%;}
 
-      <div class="card topbar">
-        <div>Protocol:
-          <select id="protocol_type" class="sel" style="width:auto;">
+  /* station type tint (neutral, not IFU colors) */
+  .input{background:rgba(255,255,255,.02);}
+  .output{background:rgba(255,255,255,.02);}
+  .oven{background:rgba(255,120,120,.10);}
+  .water{background:rgba(120,190,255,.10);}
+  .bath{background:rgba(255,255,255,.03);}
+
+  /* per-tile highlight */
+  .ok{outline:2px solid rgba(46,204,113,.8);}
+  .warn{outline:2px solid rgba(241,196,15,.8);}
+  .block{outline:2px solid rgba(231,76,60,.85);}
+
+  .finding{
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:14px;
+    padding:10px;
+    margin:8px 0;
+    background:rgba(0,0,0,.12);
+  }
+  .finding .code{font-weight:900;letter-spacing:.3px;}
+  .finding .lvl{opacity:.85;}
+  .finding .msg{margin-top:6px;opacity:.9;}
+  .finding .det{margin-top:8px;opacity:.75;font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:pre-wrap;}
+  .two{display:grid;grid-template-columns:1fr;gap:10px;}
+  @media (min-width: 520px){ .two{grid-template-columns:1fr 1fr;} }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="pill"><span class="h-title">Badlayout – CHROMAX ST Demo</span></div>
+    <div class="pill"><a href="/">Home</a></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Layout</h3>
+      <div class="badge">Top: IN → OVEN → S1…S9 → WATER</div>
+      <div class="layout">
+        <div class="rowgrid" id="toprow">__TOP__</div>
+      </div>
+
+      <div class="badge">Bottom: S18…S10 → OUT</div>
+      <div class="layout">
+        <div class="rowgrid" id="bottomrow">__BOTTOM__</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Run Settings</h3>
+      <div class="controls">
+        <div class="field">
+          <label>Protocol Type</label>
+          <select id="protocol_type">
             <option value="H&E">H&E</option>
             <option value="Custom">Custom</option>
           </select>
         </div>
-        <div>Slides: <input id="slides" type="number" value="48" class="num"></div>
-        <div>Max Slides: <input id="max_slides" type="number" value="60" class="num"></div>
-        <div>Temp °C: <input id="temp" type="number" value="22" class="num"></div>
-        <a href="/" class="badge">Home</a>
-      </div>
-
-      <div class="card layout">
-        <div class="badge">Top row: IN → OVEN → S1…S9 → WATER</div>
-        <div class="rowgrid" id="toprow">{top_html}</div>
-
-        <div class="badge">Bottom row: S18…S10 → OUT</div>
-        <div class="rowgrid" id="bottomrow">{bottom_html}</div>
-      </div>
-
-      <div class="card">
-        <h3>Reagents</h3>
-        {reagent_rows}
-      </div>
-
-      <div class="card">
-        <button onclick="preset_he()">Preset H&E</button>
-        <button onclick="preset_warn()">Preset WARN</button>
-        <button onclick="preset_block()">Preset BLOCK</button>
-        <button onclick="check_layout()">CHECK Layout</button>
-      </div>
-
-      <div class="card">
-        <h3>Result</h3>
-        <div id="result_badge" class="badge">⚪ (no check)</div>
-        <div id="out" class="out"></div>
-      </div>
-
-      <script>
-        const PATH = {path_js};
-
-        function setOverallBadge(overall) {{
-          const badge = document.getElementById('result_badge');
-          if(overall === "OK") badge.textContent = "🟢 OK";
-          else if(overall === "WARN") badge.textContent = "🟡 WARN";
-          else if(overall === "BLOCK") badge.textContent = "🔴 BLOCK";
-          else badge.textContent = "⚪ (no check)";
-        }}
-
-        function clearHighlights() {{
-          const all = document.querySelectorAll('.tile');
-          all.forEach(t => {{
-            t.classList.remove('ok','warn','block');
-          }});
-        }}
-
-        function getBathsFromPath() {{
-          const baths = [];
-          for(const id of PATH) {{
-            const stepEl = document.getElementById('step_'+id);
-            const timeEl = document.getElementById('time_'+id);
-            if(!stepEl || !timeEl) continue;
-
-            const step = (stepEl.value || "none");
-            const time = parseInt(timeEl.value || "0");
-            baths.push({{station:id, step:step, time_sec:time}});
-          }}
-          return baths;
-        }}
-
-        function getReagents() {{
-          return {{
-            "hematoxylin": {{
-              volume_ml: parseFloat(document.getElementById('r_hematoxylin_vol').value || '0'),
-              min_required_ml: parseFloat(document.getElementById('r_hematoxylin_min').value || '0')
-            }},
-            "eosin": {{
-              volume_ml: parseFloat(document.getElementById('r_eosin_vol').value || '0'),
-              min_required_ml: parseFloat(document.getElementById('r_eosin_min').value || '0')
-            }}
-          }};
-        }}
-
-        async function check_layout() {{
-          clearHighlights();
-
-          const payload = {{
-            protocol_type: document.getElementById('protocol_type').value,
-            slides_loaded: parseInt(document.getElementById('slides').value || '0'),
-            max_slides_supported: parseInt(document.getElementById('max_slides').value || '0'),
-            temperature_c: parseFloat(document.getElementById('temp').value || '0'),
-            baths: getBathsFromPath(),
-            reagents: getReagents()
-          }};
-
-          const r = await fetch('/api/test_layout', {{
-            method: 'POST',
-            headers: {{'Content-Type':'application/json'}},
-            body: JSON.stringify(payload)
-          }});
-          const data = await r.json();
-          setOverallBadge(data.overall);
-          document.getElementById('out').textContent = JSON.stringify(data, null, 2);
-
-          // Simple highlight: mark used stations as OK/WARN/BLOCK based on overall
-          // (Next step: map specific findings to specific stations.)
-          const cls = (data.overall === "OK") ? "ok" : (data.overall === "WARN") ? "warn" : "block";
-          for(const b of payload.baths) {{
-            if(b.step && b.step !== "none" && b.time_sec > 0) {{
-              const t = document.getElementById('tile_'+b.station);
-              if(t) t.classList.add(cls);
-            }}
-          }}
-        }}
-
-        function clearAllStations() {{
-          for(const id of PATH) {{
-            const stepEl = document.getElementById('step_'+id);
-            const timeEl = document.getElementById('time_'+id);
-            if(stepEl) stepEl.value = "none";
-            if(timeEl) timeEl.value = "0";
-          }}
-        }}
-
-        function preset_he() {{
-          document.getElementById('protocol_type').value = "H&E";
-          document.getElementById('slides').value = "48";
-          document.getElementById('max_slides').value = "60";
-          document.getElementById('temp').value = "22";
-
-          document.getElementById('r_hematoxylin_vol').value = "350";
-          document.getElementById('r_hematoxylin_min').value = "300";
-          document.getElementById('r_eosin_vol').value = "450";
-          document.getElementById('r_eosin_min').value = "300";
-
-          clearAllStations();
-
-          // Put steps along early stations to match order
-          const seq = [
-            ["S1","deparaffinization",300],
-            ["S2","hematoxylin",180],
-            ["S3","rinse",60],
-            ["S4","eosin",120],
-            ["S5","dehydrate",240],
-            ["S6","clear",180],
-          ];
-          for(const [sid, step, t] of seq) {{
-            document.getElementById('step_'+sid).value = step;
-            document.getElementById('time_'+sid).value = String(t);
-          }}
-          // Optional: water station can be used for rinse too (if you want):
-          // document.getElementById('step_W1').value = "rinse";
-          // document.getElementById('time_W1').value = "60";
-        }}
-
-        function preset_warn() {{
-          preset_he();
-          document.getElementById('slides').value = "55"; // W201
-          document.getElementById('time_S2').value = "90"; // W202
-        }}
-
-        function preset_block() {{
-          preset_he();
-          document.getElementById('slides').value = "70"; // E101
-          document.getElementById('r_hematoxylin_vol').value = "200"; // E301
-          // Remove rinse
-          document.getElementById('step_S3').value = "none"; // E202 + E201
-          document.getElementById('time_S3').value = "0";
-        }}
-      </script>
-    </body></html>
-    """
-    return html }
-
-    reagent_rows = ""
-    for name, r in default_reagents.items():
-        reagent_rows += f"""
-        <div class="reagent-row">
-          <div><b>{name}</b></div>
-          <div>vol <input type="number" id="r_{name}_vol" value="{r['volume_ml']}" style="width:90px;"> ml</div>
-          <div>min <input type="number" id="r_{name}_min" value="{r['min_required_ml']}" style="width:90px;"> ml</div>
+        <div class="field">
+          <label>Slides Loaded</label>
+          <input id="slides" type="number" value="48" />
         </div>
-        """
-
-    station_cards = ""
-    for i in range(1, stations+1):
-        station_cards += f"""
-        <div class="bath">
-          <div class="bath-title">Station {i}</div>
-          <div>
-            <select id="step_{i}" style="width:100%; padding:10px; border-radius:10px;">
-              {opts_html}
-            </select>
-          </div>
-          <div style="margin-top:8px;">
-            Zeit (s):
-            <input type="number" id="time_{i}" value="0" style="width:100%; padding:10px; border-radius:10px;">
-          </div>
+        <div class="field">
+          <label>Max Slides Supported</label>
+          <input id="max_slides" type="number" value="60" />
         </div>
-        """
+        <div class="field">
+          <label>Temperature (°C)</label>
+          <input id="temp" type="number" value="22" />
+        </div>
+      </div>
 
-    html = f"""
-    <html><head>
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>Badlayout</title>
-      <style>
-        body {{ font-family:-apple-system, Arial; padding: 14px; }}
-        .top {{ display:flex; gap:10px; flex-wrap:wrap; }}
-        .card {{ border:1px solid #ddd; border-radius:14px; padding:14px; margin:12px 0; }}
-        .grid {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:12px; }}
-        .bath {{ border:1px solid #e5e5e5; border-radius:14px; padding:12px; }}
-        .bath-title {{ font-weight:700; margin-bottom:8px; }}
-        button {{ padding:12px 14px; border-radius:12px; border:1px solid #ccc; }}
-        .out {{ white-space:pre-wrap; font-family: ui-monospace, Menlo, monospace; }}
-        .reagent-row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid #eee; }}
-        .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; }}
-      </style>
-    </head>
-    <body>
-      <h2>Badlayout Screen</h2>
+      <div style="height:12px"></div>
 
-      <div class="card top">
+      <h3>Reagents</h3>
+      <div class="two">
         <div>
-          Protocol:
-          <select id="protocol_type" style="padding:10px; border-radius:10px;">
-            <option value="H&E">H&E</option>
-            <option value="Custom">Custom</option>
-          </select>
+          <label>Hematoxylin volume (ml)</label>
+          <input id="r_hematoxylin_vol" type="number" value="350" />
+          <label style="margin-top:8px">Hematoxylin min (ml)</label>
+          <input id="r_hematoxylin_min" type="number" value="300" />
         </div>
-        <div>Slides: <input id="slides" type="number" value="48" style="width:90px; padding:10px; border-radius:10px;"></div>
-        <div>Max Slides: <input id="max_slides" type="number" value="60" style="width:90px; padding:10px; border-radius:10px;"></div>
-        <div>Temp °C: <input id="temp" type="number" value="22" style="width:90px; padding:10px; border-radius:10px;"></div>
-        <div><a href="/" class="badge">Home</a></div>
-      </div>
-
-      <div class="card">
-        <h3>Stations / Baths</h3>
-        <div class="grid">
-          {station_cards}
+        <div>
+          <label>Eosin volume (ml)</label>
+          <input id="r_eosin_vol" type="number" value="450" />
+          <label style="margin-top:8px">Eosin min (ml)</label>
+          <input id="r_eosin_min" type="number" value="300" />
         </div>
       </div>
 
-      <div class="card">
-        <h3>Reagents</h3>
-        {reagent_rows}
-      </div>
-
-      <div class="card">
+      <div class="btnbar">
         <button onclick="preset_he()">Preset H&E</button>
         <button onclick="preset_warn()">Preset WARN</button>
-        <button onclick="preset_block()">Preset BLOCK</button>
-        <button onclick="check_layout()">CHECK Layout</button>
+        <button class="danger" onclick="preset_block()">Preset BLOCK</button>
+        <button class="primary" onclick="check_layout()">CHECK Layout</button>
+        <button onclick="reset_all()">Reset</button>
       </div>
 
-      <div class="card">
-        <h3>Result</h3>
-        <div id="result_badge" class="badge">⚪ (no check)</div>
-        <div id="out" class="out"></div>
+      <div style="height:12px"></div>
+
+      <h3>Result</h3>
+      <div id="result_badge" class="badge">⚪ (no check)</div>
+      <div id="findings"></div>
+      <div id="raw" class="finding" style="display:none">
+        <div class="det" id="rawjson"></div>
       </div>
+    </div>
+  </div>
 
-      <script>
-        function getBaths() {{
-          const baths = [];
-          for(let i=1;i<={stations};i++) {{
-            const step = document.getElementById('step_'+i).value;
-            const time = parseInt(document.getElementById('time_'+i).value || '0');
-            baths.push({{station:i, step:step, time_sec:time}});
-          }}
-          return baths;
-        }}
+<script>
+const PATH = __PATH__;
 
-        function getReagents() {{
-          return {{
-            "hematoxylin": {{
-              volume_ml: parseFloat(document.getElementById('r_hematoxylin_vol').value || '0'),
-              min_required_ml: parseFloat(document.getElementById('r_hematoxylin_min').value || '0')
-            }},
-            "eosin": {{
-              volume_ml: parseFloat(document.getElementById('r_eosin_vol').value || '0'),
-              min_required_ml: parseFloat(document.getElementById('r_eosin_min').value || '0')
-            }}
-          }};
-        }}
+function setBadge(overall){
+  const b = document.getElementById('result_badge');
+  b.classList.remove('status-ok','status-warn','status-block');
+  if(overall === "OK"){ b.textContent = "🟢 OK"; b.classList.add('status-ok'); }
+  else if(overall === "WARN"){ b.textContent = "🟡 WARN"; b.classList.add('status-warn'); }
+  else if(overall === "BLOCK"){ b.textContent = "🔴 BLOCK"; b.classList.add('status-block'); }
+  else { b.textContent = "⚪ (no check)"; }
+}
 
-        function setOverallBadge(overall) {{
-          const badge = document.getElementById('result_badge');
-          if(overall === "OK") badge.textContent = "🟢 OK";
-          else if(overall === "WARN") badge.textContent = "🟡 WARN";
-          else if(overall === "BLOCK") badge.textContent = "🔴 BLOCK";
-          else badge.textContent = "⚪ (no check)";
-        }}
+function clearHighlights(){
+  document.querySelectorAll('.tile').forEach(t=>{
+    t.classList.remove('ok','warn','block');
+  });
+}
 
-        async function check_layout() {{
-          const payload = {{
-            protocol_type: document.getElementById('protocol_type').value,
-            slides_loaded: parseInt(document.getElementById('slides').value || '0'),
-            max_slides_supported: parseInt(document.getElementById('max_slides').value || '0'),
-            temperature_c: parseFloat(document.getElementById('temp').value || '0'),
-            baths: getBaths(),
-            reagents: getReagents()
-          }};
-          const r = await fetch('/api/test_layout', {{
-            method: 'POST',
-            headers: {{'Content-Type':'application/json'}},
-            body: JSON.stringify(payload)
-          }});
-          const data = await r.json();
-          setOverallBadge(data.overall);
-          document.getElementById('out').textContent = JSON.stringify(data, null, 2);
-        }}
+function getBaths(){
+  const baths = [];
+  for(const id of PATH){
+    const stepEl = document.getElementById('step_'+id);
+    const timeEl = document.getElementById('time_'+id);
+    if(!stepEl || !timeEl) continue;
+    baths.push({ station:id, step:stepEl.value, time_sec: parseInt(timeEl.value || "0") });
+  }
+  return baths;
+}
 
-        function clearAll() {{
-          for(let i=1;i<={stations};i++) {{
-            document.getElementById('step_'+i).value = "none";
-            document.getElementById('time_'+i).value = "0";
-          }}
-        }}
+function getReagents(){
+  return {
+    hematoxylin: {
+      volume_ml: parseFloat(document.getElementById('r_hematoxylin_vol').value || "0"),
+      min_required_ml: parseFloat(document.getElementById('r_hematoxylin_min').value || "0")
+    },
+    eosin: {
+      volume_ml: parseFloat(document.getElementById('r_eosin_vol').value || "0"),
+      min_required_ml: parseFloat(document.getElementById('r_eosin_min').value || "0")
+    }
+  };
+}
 
-        function preset_he() {{
-          document.getElementById('protocol_type').value = "H&E";
-          document.getElementById('slides').value = "48";
-          document.getElementById('max_slides').value = "60";
-          document.getElementById('temp').value = "22";
-          document.getElementById('r_hematoxylin_vol').value = "350";
-          document.getElementById('r_hematoxylin_min').value = "300";
-          document.getElementById('r_eosin_vol').value = "450";
-          document.getElementById('r_eosin_min').value = "300";
+function renderFindings(data){
+  const wrap = document.getElementById('findings');
+  wrap.innerHTML = "";
+  if(!data.findings || data.findings.length === 0){
+    wrap.innerHTML = "<div class='finding'><div class='code'>OK</div><div class='msg'>Keine Findings.</div></div>";
+    return;
+  }
+  data.findings.forEach(f=>{
+    const det = f.details ? JSON.stringify(f.details, null, 2) : "";
+    const html = `
+      <div class="finding">
+        <div><span class="code">${f.code}</span> &nbsp; <span class="lvl">${f.level}</span></div>
+        <div class="msg">${f.message}</div>
+        ${det ? `<div class="det">${det}</div>` : ""}
+      </div>
+    `;
+    wrap.insertAdjacentHTML("beforeend", html);
+  });
+}
 
-          clearAll();
-          // Sequence on stations
-          const seq = [
-            ["deparaffinization",300],
-            ["hematoxylin",180],
-            ["rinse",60],
-            ["eosin",120],
-            ["dehydrate",240],
-            ["clear",180]
-          ];
-          for(let i=0;i<seq.length;i++) {{
-            document.getElementById('step_'+(i+1)).value = seq[i][0];
-            document.getElementById('time_'+(i+1)).value = seq[i][1];
-          }}
-        }}
+async function check_layout(){
+  clearHighlights();
 
-        function preset_warn() {{
-          preset_he();
-          document.getElementById('slides').value = "55";     // W201
-          document.getElementById('time_2').value = "90";     // W202 hematoxylin time
-        }}
+  const payload = {
+    protocol_type: document.getElementById('protocol_type').value,
+    slides_loaded: parseInt(document.getElementById('slides').value || "0"),
+    max_slides_supported: parseInt(document.getElementById('max_slides').value || "0"),
+    temperature_c: parseFloat(document.getElementById('temp').value || "0"),
+    baths: getBaths(),
+    reagents: getReagents()
+  };
 
-        function preset_block() {{
-          preset_he();
-          document.getElementById('slides').value = "70";     // E101
-          document.getElementById('r_hematoxylin_vol').value = "200"; // E301
-          // remove rinse
-          document.getElementById('step_3').value = "none";   // E202 + E201
-          document.getElementById('time_3').value = "0";
-        }}
-      </script>
-    </body></html>
-    """
-    return html
+  const r = await fetch('/api/test_layout', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json();
+  setBadge(data.overall);
+  renderFindings(data);
+
+  // simple highlight for used stations by overall severity
+  const cls = (data.overall === "OK") ? "ok" : (data.overall === "WARN") ? "warn" : "block";
+  payload.baths.forEach(b=>{
+    if(b.step && b.step !== "none" && b.time_sec > 0){
+      const tile = document.getElementById('tile_'+b.station);
+      if(tile) tile.classList.add(cls);
+    }
+  });
+
+  // raw json (hidden by default, easy to enable)
+  document.getElementById('rawjson').textContent = JSON.stringify(data, null, 2);
+}
+
+function reset_all(){
+  for(const id of PATH){
+    const s = document.getElementById('step_'+id);
+    const t = document.getElementById('time_'+id);
+    if(s) s.value = "none";
+    if(t) t.value = "0";
+  }
+  setBadge(null);
+  document.getElementById('findings').innerHTML = "";
+  clearHighlights();
+}
+
+function preset_he(){
+  reset_all();
+  document.getElementById('protocol_type').value = "H&E";
+  document.getElementById('slides').value = "48";
+  document.getElementById('max_slides').value = "60";
+  document.getElementById('temp').value = "22";
+  document.getElementById('r_hematoxylin_vol').value = "350";
+  document.getElementById('r_hematoxylin_min').value = "300";
+  document.getElementById('r_eosin_vol').value = "450";
+  document.getElementById('r_eosin_min').value = "300";
+
+  // device-ish: use OVEN optionally
+  document.getElementById('step_OVEN').value = "oven";
+  document.getElementById('time_OVEN').value = "180";
+
+  // put sequence early along baths
+  const seq = [
+    ["S1","deparaffinization",300],
+    ["S2","hematoxylin",180],
+    ["W1","rinse",60],           // rinse on WATER to satisfy type check
+    ["S3","eosin",120],
+    ["S4","dehydrate",240],
+    ["S5","clear",180]
+  ];
+  seq.forEach(([sid, step, t])=>{
+    const s = document.getElementById('step_'+sid);
+    const tt = document.getElementById('time_'+sid);
+    if(s) s.value = step;
+    if(tt) tt.value = String(t);
+  });
+}
+
+function preset_warn(){
+  preset_he();
+  document.getElementById('slides').value = "55";   // W201
+  document.getElementById('time_S2').value = "90";  // W202 hematoxylin time
+}
+
+function preset_block(){
+  preset_he();
+  document.getElementById('slides').value = "70";                 // E101
+  document.getElementById('r_hematoxylin_vol').value = "200";     // E301
+  // make rinse invalid by removing it
+  document.getElementById('step_W1').value = "none";              // E202 + E201
+  document.getElementById('time_W1').value = "0";
+}
+</script>
+
+</body>
+</html>
+"""
+
+    html = tpl.replace("__TOP__", top_html) \
+              .replace("__BOTTOM__", bottom_html) \
+              .replace("__PATH__", path_js)
+    return HTMLResponse(html)
