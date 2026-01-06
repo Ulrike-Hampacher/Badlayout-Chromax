@@ -4,9 +4,8 @@ from pydantic import BaseModel
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-import json
 
-app = FastAPI(title="CHROMAX ST Demo Device")
+app = FastAPI(title="CHROMAX ST Demo Device (Badlayout)")
 
 # ----------------------------
 # Helpers
@@ -18,34 +17,36 @@ def ampel(overall: Optional[str]) -> str:
     return {"OK": "🟢 OK", "WARN": "🟡 WARN", "BLOCK": "🔴 BLOCK"}.get(overall or "", "⚪ (no check)")
 
 # ----------------------------
-# Protocol library (Demo)
-# ----------------------------
-PROTOCOL_LIBRARY = {
-    "H&E_STD": {
-        "protocol_type": "H&E",
-        "steps": [
-            ("deparaffinization", 300),
-            ("hematoxylin", 180),
-            ("rinse", 60),
-            ("eosin", 120),
-            ("dehydrate", 240),
-            ("clear", 180),
-        ],
-    }
-}
-
-# ----------------------------
 # Rules with codes
 # ----------------------------
 RULES: Dict[str, Any] = {
     "rules": [
-        {"id": "R-ST-SLIDE-LIMIT", "then": {"code": "E101", "require_max": {"field": "slides_loaded", "max_from_field": "max_slides_supported"}, "level": "BLOCK", "message": "Maximale Objektträgerzahl überschritten."}},
-        {"id": "R-ST-SLIDE-HIGH",  "then": {"code": "W201", "warn_if_greater": {"field": "slides_loaded", "threshold": 50}, "level": "WARN", "message": "Hohe Objektträgerzahl: mögliches QC-Risiko."}},
-        {"id": "R-ST-TEMP-RANGE",  "then": {"code": "E103", "require_range": {"field": "temperature_c", "min": 15, "max": 30}, "level": "BLOCK", "message": "Betriebstemperatur außerhalb 15–30°C."}},
-        {"id": "R-ST-SEQ-HE", "when": {"protocol_type": "H&E"}, "then": {"code": "E201", "must_contain_order": {"sequence": ["deparaffinization","hematoxylin","rinse","eosin","dehydrate","clear"]}, "level": "BLOCK", "message": "Ungültige oder unvollständige H&E-Schrittfolge."}},
-        {"id": "R-ST-REQ-RINSE", "then": {"code": "E202", "require_step": {"name": "rinse"}, "level": "BLOCK", "message": "Pflichtschritt fehlt: rinse."}},
-        {"id": "R-ST-HEMA-TIME", "when": {"protocol_type": "H&E"}, "then": {"code": "W202", "step_time_range": {"step": "hematoxylin", "min": 120, "max": 300}, "level": "WARN", "message": "Hematoxylin-Zeit außerhalb 120–300s."}},
-        {"id": "R-ST-REAGENT-MIN", "then": {"code": "E301", "reagent_minimum": True, "level": "BLOCK", "message": "Mindestens ein Reagenz unter Mindestfüllstand."}},
+        {"id": "R-ST-SLIDE-LIMIT",
+         "then": {"code": "E101", "require_max": {"field": "slides_loaded", "max_from_field": "max_slides_supported"},
+                  "level": "BLOCK", "message": "Maximale Objektträgerzahl überschritten."}},
+        {"id": "R-ST-SLIDE-HIGH",
+         "then": {"code": "W201", "warn_if_greater": {"field": "slides_loaded", "threshold": 50},
+                  "level": "WARN", "message": "Hohe Objektträgerzahl: mögliches QC-Risiko."}},
+        {"id": "R-ST-TEMP-RANGE",
+         "then": {"code": "E103", "require_range": {"field": "temperature_c", "min": 15, "max": 30},
+                  "level": "BLOCK", "message": "Betriebstemperatur außerhalb 15–30°C."}},
+
+        # H&E sequence rule (Demo)
+        {"id": "R-ST-SEQ-HE", "when": {"protocol_type": "H&E"},
+         "then": {"code": "E201", "must_contain_order": {"sequence": ["deparaffinization","hematoxylin","rinse","eosin","dehydrate","clear"]},
+                  "level": "BLOCK", "message": "Ungültige oder unvollständige H&E-Schrittfolge."}},
+
+        {"id": "R-ST-REQ-RINSE",
+         "then": {"code": "E202", "require_step": {"name": "rinse"},
+                  "level": "BLOCK", "message": "Pflichtschritt fehlt: rinse."}},
+
+        {"id": "R-ST-HEMA-TIME", "when": {"protocol_type": "H&E"},
+         "then": {"code": "W202", "step_time_range": {"step": "hematoxylin", "min": 120, "max": 300},
+                  "level": "WARN", "message": "Hematoxylin-Zeit außerhalb 120–300s."}},
+
+        {"id": "R-ST-REAGENT-MIN",
+         "then": {"code": "E301", "reagent_minimum": True,
+                  "level": "BLOCK", "message": "Mindestens ein Reagenz unter Mindestfüllstand."}},
     ]
 }
 SEVERITY = {"OK": 1, "WARN": 2, "BLOCK": 3}
@@ -66,7 +67,6 @@ class Reagent:
 @dataclass
 class RunInput:
     run_id: str
-    protocol_id: str
     protocol_type: str
     run_state: str
     slides_loaded: int
@@ -78,7 +78,6 @@ class RunInput:
 def run_to_dict(run: RunInput) -> Dict[str, Any]:
     return {
         "run_id": run.run_id,
-        "protocol_id": run.protocol_id,
         "protocol_type": run.protocol_type,
         "run_state": run.run_state,
         "slides_loaded": run.slides_loaded,
@@ -113,7 +112,8 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
             mx = float(then["require_range"]["max"])
             val = float(run_dict[f])
             if not (mn <= val <= mx):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"field": f, "min": mn, "max": mx, "actual": val}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"field": f, "min": mn, "max": mx, "actual": val}})
                 continue
 
         if "require_max" in then:
@@ -121,7 +121,8 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
             mf = then["require_max"]["max_from_field"]
             val = int(run_dict[f]); mx = int(run_dict[mf])
             if val > mx:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"field": f, "max": mx, "actual": val}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"field": f, "max": mx, "actual": val}})
                 continue
 
         if "warn_if_greater" in then:
@@ -129,7 +130,8 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
             th = float(then["warn_if_greater"]["threshold"])
             val = float(run_dict[f])
             if val > th:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"field": f, "threshold": th, "actual": val}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"field": f, "threshold": th, "actual": val}})
                 continue
 
         if "must_contain_order" in then:
@@ -143,13 +145,15 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
                     break
                 idx = actual.index(step)
             if not ok:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"required_sequence": required, "actual": actual}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"required_sequence": required, "actual": actual}})
             continue
 
         if "require_step" in then:
             need = then["require_step"]["name"]
             if need not in steps_list(run_dict):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"missing_step": need}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"missing_step": need}})
                 continue
 
         if "step_time_range" in then:
@@ -158,7 +162,8 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
             mx = int(then["step_time_range"]["max"])
             t = next((s["time_sec"] for s in run_dict["steps"] if s["name"] == name), None)
             if t is None or not (mn <= int(t) <= mx):
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"step": name, "min": mn, "max": mx, "actual": t}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"step": name, "min": mn, "max": mx, "actual": t}})
                 continue
 
         if then.get("reagent_minimum"):
@@ -167,7 +172,8 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
                 if float(r["volume_ml"]) < float(r["min_required_ml"]):
                     below.append({"reagent": name, "volume_ml": r["volume_ml"], "min_required_ml": r["min_required_ml"]})
             if below:
-                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg, "details": {"below_min": below}})
+                findings.append({"rule_id": rid, "code": code, "level": level, "message": msg,
+                                 "details": {"below_min": below}})
                 continue
 
     overall = "OK"
@@ -175,258 +181,325 @@ def evaluate(run: RunInput) -> Dict[str, Any]:
         if SEVERITY[f["level"]] > SEVERITY[overall]:
             overall = f["level"]
 
-    return {"run_id": run.run_id, "protocol_id": run.protocol_id, "overall": overall, "findings": findings}
-
-def build_run(run_id: str, protocol_id: str, slides_loaded: int, max_slides_supported: int, temperature_c: float,
-              reagent_state: Dict[str, tuple], step_overrides: Optional[Dict[str, int]] = None) -> RunInput:
-    proto = PROTOCOL_LIBRARY[protocol_id]
-    steps = []
-    for name, t in proto["steps"]:
-        if step_overrides and name in step_overrides:
-            steps.append(Step(name, int(step_overrides[name])))
-        else:
-            steps.append(Step(name, int(t)))
-
-    reagents = {k: Reagent(float(v[0]), float(v[1])) for k, v in reagent_state.items()}
-    return RunInput(
-        run_id=run_id,
-        protocol_id=protocol_id,
-        protocol_type=proto["protocol_type"],
-        run_state="READY",
-        slides_loaded=int(slides_loaded),
-        max_slides_supported=int(max_slides_supported),
-        temperature_c=float(temperature_c),
-        steps=steps,
-        reagents=reagents
-    )
+    return {"run_id": run.run_id, "overall": overall, "findings": findings}
 
 # ----------------------------
-# Device state (server-side singleton demo)
+# Device singleton (super simple)
 # ----------------------------
 class Device:
     def __init__(self):
-        self.mode = "NORMAL"   # NORMAL / MAINTENANCE
-        self.state = "READY"   # READY / RUNNING / COMPLETE
+        self.state = "READY"
         self.operator: Optional[str] = None
-        self.current_run: Optional[RunInput] = None
         self.last_result: Optional[Dict[str, Any]] = None
         self.audit: List[Dict[str, Any]] = []
-        self._audit("BOOT", {})
 
-    def _audit(self, event, details):
-        self.audit.append({"t": now(), "event": event, "details": details, "operator": self.operator, "mode": self.mode, "state": self.state})
+    def log(self, event, details=None):
+        self.audit.append({"t": now(), "event": event, "details": details or {}, "operator": self.operator, "state": self.state})
 
     def status(self):
         return {
-            "mode": self.mode,
             "state": self.state,
             "operator": self.operator,
-            "run_id": self.current_run.run_id if self.current_run else None,
-            "protocol_id": self.current_run.protocol_id if self.current_run else None,
             "overall": self.last_result["overall"] if self.last_result else None,
             "findings": len(self.last_result["findings"]) if self.last_result else None,
         }
 
 device = Device()
+device.log("BOOT")
 
 # ----------------------------
-# API models
+# API payload for Badlayout test
 # ----------------------------
-class LoginReq(BaseModel):
-    name: str
-    pin: str
+class LayoutTestReq(BaseModel):
+    protocol_type: str = "H&E"
+    slides_loaded: int = 48
+    max_slides_supported: int = 60
+    temperature_c: float = 22.0
+    baths: List[Dict[str, Any]]  # [{station:1, step:"hematoxylin", time_sec:180}, ...]
+    reagents: Dict[str, Dict[str, float]]  # {"hematoxylin":{"volume_ml":350,"min_required_ml":300}, ...}
+
+@app.post("/api/test_layout")
+def api_test_layout(req: LayoutTestReq):
+    steps = []
+    for b in req.baths:
+        name = (b.get("step") or "").strip()
+        t = int(b.get("time_sec") or 0)
+        if name and name != "none" and t > 0:
+            steps.append(Step(name=name, time_sec=t))
+
+    reagents = {}
+    for k, v in req.reagents.items():
+        reagents[k] = Reagent(volume_ml=float(v.get("volume_ml", 0)), min_required_ml=float(v.get("min_required_ml", 0)))
+
+    run = RunInput(
+        run_id="RUN-BADLAYOUT",
+        protocol_type=req.protocol_type,
+        run_state="READY",
+        slides_loaded=int(req.slides_loaded),
+        max_slides_supported=int(req.max_slides_supported),
+        temperature_c=float(req.temperature_c),
+        steps=steps,
+        reagents=reagents
+    )
+    result = evaluate(run)
+    device.last_result = result
+    device.log("TEST_LAYOUT", {"overall": result["overall"], "n": len(result["findings"])})
+    return result
 
 # ----------------------------
-# Web UI
+# Pages
 # ----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     st = device.status()
     html = f"""
-    <html>
-    <head>
+    <html><head>
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>CHROMAX ST Demo</title>
       <style>
         body {{ font-family: -apple-system, Arial; padding: 16px; }}
-        .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin: 10px 0; }}
-        button {{ padding: 10px 12px; margin: 6px 6px 6px 0; border-radius: 10px; border: 1px solid #ccc; }}
+        .card {{ border:1px solid #ddd; border-radius: 14px; padding: 14px; margin: 12px 0; }}
+        a.button {{ display:inline-block; padding:10px 12px; border:1px solid #ccc; border-radius:12px; text-decoration:none; margin-right:8px; }}
         .mono {{ font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; }}
       </style>
     </head>
     <body>
-      <h2>CHROMAX ST (DEMO DEVICE)</h2>
-
+      <h2>CHROMAX ST (DEMO)</h2>
       <div class="card">
-        <div><b>MODE</b>: {st["mode"]}</div>
         <div><b>STATE</b>: {st["state"]}</div>
         <div><b>OPERATOR</b>: {st["operator"] or "-"}</div>
-        <div><b>RUN</b>: {st["run_id"] or "-"}</div>
-        <div><b>PROTOCOL</b>: {st["protocol_id"] or "-"}</div>
         <div><b>CHECK</b>: {ampel(st["overall"])}</div>
         <div><b>FINDINGS</b>: {st["findings"] if st["findings"] is not None else "-"}</div>
       </div>
 
       <div class="card">
-        <h3>Actions</h3>
-
-        <div>
-          <button onclick="api('/api/load/ok')">Load OK</button>
-          <button onclick="api('/api/load/warn')">Load WARN</button>
-          <button onclick="api('/api/load/block')">Load BLOCK</button>
-        </div>
-
-        <div>
-          <button onclick="api('/api/check')">CHECK</button>
-          <button onclick="api('/api/start')">START</button>
-          <button onclick="api('/api/stop')">STOP</button>
-        </div>
-
-        <div>
-          <button onclick="api('/api/report','GET')">REPORT</button>
-          <button onclick="api('/api/audit','GET')">AUDIT</button>
-        </div>
-
-        <div style="margin-top:10px;">
-          <input id="name" placeholder="Operator name" />
-          <input id="pin" placeholder="PIN" />
-          <button onclick="login()">Login</button>
-          <button onclick="api('/api/logout')">Logout</button>
-        </div>
-
-        <div class="mono" id="out"></div>
+        <h3>Badlayout</h3>
+        <a class="button" href="/layout">Open Badlayout Screen</a>
+        <a class="button" href="/audit">Audit</a>
+        <a class="button" href="/last">Last Result</a>
       </div>
 
-      <script>
-        async function api(path, method='POST', body=null) {{
-          const opts = {{ method }};
-          if(body) {{
-            opts.headers = {{'Content-Type':'application/json'}};
-            opts.body = JSON.stringify(body);
-          }}
-          const r = await fetch(path, opts);
-          const t = await r.text();
-          document.getElementById('out').textContent = t;
-        }}
-
-        async function login() {{
-          const name = document.getElementById('name').value || 'Operator';
-          const pin = document.getElementById('pin').value || '1234';
-          await api('/api/login','POST',{{name,pin}});
-        }}
-      </script>
-    </body>
-    </html>
+      <div class="card">
+        <div class="mono">
+Tipp: Im Badlayout Screen kannst du pro Station Schritt + Zeit einstellen,
+Reagenzien füllen und dann CHECK drücken.
+        </div>
+      </div>
+    </body></html>
     """
     return html
 
-# ----------------------------
-# API endpoints
-# ----------------------------
-@app.post("/api/login")
-def api_login(req: LoginReq):
-    if req.pin != "1234":
-        device._audit("LOGIN_FAIL", {"name": req.name})
-        return JSONResponse({"ok": False, "msg": "PIN falsch (Demo: 1234)."}, status_code=401)
-    device.operator = req.name
-    device._audit("LOGIN_OK", {"name": req.name})
-    return {"ok": True, "msg": f"Logged in: {req.name}"}
+@app.get("/last", response_class=HTMLResponse)
+def last():
+    res = device.last_result or {"overall": None, "findings": []}
+    return HTMLResponse(f"<pre>{res}</pre>")
 
-@app.post("/api/logout")
-def api_logout():
-    device._audit("LOGOUT", {"name": device.operator})
-    device.operator = None
-    return {"ok": True, "msg": "Logged out"}
-
-@app.post("/api/load/{which}")
-def api_load(which: str):
-    if which == "ok":
-        run = build_run("RUN-OK", "H&E_STD", 48, 60, 22, {"hematoxylin": (350, 300), "eosin": (450, 300)})
-    elif which == "warn":
-        run = build_run("RUN-WARN", "H&E_STD", 55, 60, 22, {"hematoxylin": (330, 300), "eosin": (450, 300)}, step_overrides={"hematoxylin": 90})
-    elif which == "block":
-        run = build_run("RUN-BLOCK", "H&E_STD", 70, 60, 22, {"hematoxylin": (200, 300), "eosin": (450, 300)})
-    else:
-        return JSONResponse({"ok": False, "msg": "unknown preset"}, status_code=400)
-
-    if device.state == "RUNNING":
-        return JSONResponse({"ok": False, "msg": "RUNNING – cannot load"}, status_code=409)
-
-    device.current_run = run
-    device.last_result = None
-    device.state = "READY"
-    device._audit("RUN_LOADED", {"run_id": run.run_id, "protocol": run.protocol_id})
-    return {"ok": True, "msg": f"Loaded {run.run_id}"}
-
-@app.post("/api/check")
-def api_check():
-    if not device.current_run:
-        return JSONResponse({"ok": False, "msg": "no run loaded"}, status_code=409)
-    device.last_result = evaluate(device.current_run)
-    device._audit("CHECK", {"overall": device.last_result["overall"], "n": len(device.last_result["findings"])})
-    return device.last_result
-
-@app.post("/api/start")
-def api_start():
-    if not device.operator:
-        return JSONResponse({"ok": False, "msg": "login required"}, status_code=401)
-    if not device.current_run:
-        return JSONResponse({"ok": False, "msg": "no run loaded"}, status_code=409)
-
-    device.last_result = evaluate(device.current_run)
-    overall = device.last_result["overall"]
-    device._audit("CHECK", {"overall": overall, "n": len(device.last_result["findings"])})
-
-    if overall == "BLOCK":
-        device.state = "READY"
-        device._audit("START_BLOCKED", {})
-        return JSONResponse({"ok": False, "msg": "START blocked (BLOCK)", "result": device.last_result}, status_code=409)
-
-    device.state = "RUNNING"
-    device._audit("START", {"overall": overall})
-    return {"ok": True, "msg": f"START ok ({overall})", "result": device.last_result}
-
-@app.post("/api/stop")
-def api_stop():
-    if device.state != "RUNNING":
-        return JSONResponse({"ok": False, "msg": "not running"}, status_code=409)
-    device.state = "COMPLETE"
-    device._audit("STOP", {})
-    return {"ok": True, "msg": "STOP ok"}
-
-@app.get("/api/report", response_class=PlainTextResponse)
-def api_report():
-    st = device.status()
+@app.get("/audit", response_class=PlainTextResponse)
+def audit():
     lines = []
-    lines.append("CHROMAX ST DEMO – RUN REPORT")
-    lines.append("--------------------------------")
-    lines.append(f"Time     : {now()}")
-    lines.append(f"Mode     : {st['mode']}")
-    lines.append(f"State    : {st['state']}")
-    lines.append(f"Operator : {st['operator'] or '-'}")
-    lines.append(f"Run      : {st['run_id'] or '-'}")
-    lines.append(f"Protocol : {st['protocol_id'] or '-'}")
-    lines.append(f"Overall  : {st['overall'] or '(none)'}")
-    lines.append("--------------------------------")
-
-    if device.current_run:
-        lines.append("Steps:")
-        for s in device.current_run.steps:
-            lines.append(f" - {s.name}: {s.time_sec}s")
-        lines.append("Reagents:")
-        for name, r in device.current_run.reagents.items():
-            lines.append(f" - {name}: {r.volume_ml}ml (min {r.min_required_ml}ml)")
-
-    if device.last_result:
-        lines.append("--------------------------------")
-        lines.append("Findings:")
-        if not device.last_result["findings"]:
-            lines.append(" - none")
-        else:
-            for f in device.last_result["findings"]:
-                lines.append(f" - {f['level']} {f['code']}: {f['message']}")
+    for e in device.audit[-200:]:
+        lines.append(f"{e['t']} | {e['event']} | state={e['state']} | {e['details']}")
     return "\n".join(lines)
 
-@app.get("/api/audit")
-def api_audit():
-    return device.audit
+@app.get("/layout", response_class=HTMLResponse)
+def layout():
+    # 8 Stationen als Demo-Badlayout
+    stations = 8
+    step_options = ["none","deparaffinization","hematoxylin","rinse","eosin","dehydrate","clear"]
+
+    opts_html = "".join([f"<option value='{s}'>{s}</option>" for s in step_options])
+
+    # Default Reagents
+    default_reagents = {
+        "hematoxylin": {"volume_ml": 350, "min_required_ml": 300},
+        "eosin": {"volume_ml": 450, "min_required_ml": 300},
+    }
+
+    reagent_rows = ""
+    for name, r in default_reagents.items():
+        reagent_rows += f"""
+        <div class="reagent-row">
+          <div><b>{name}</b></div>
+          <div>vol <input type="number" id="r_{name}_vol" value="{r['volume_ml']}" style="width:90px;"> ml</div>
+          <div>min <input type="number" id="r_{name}_min" value="{r['min_required_ml']}" style="width:90px;"> ml</div>
+        </div>
+        """
+
+    station_cards = ""
+    for i in range(1, stations+1):
+        station_cards += f"""
+        <div class="bath">
+          <div class="bath-title">Station {i}</div>
+          <div>
+            <select id="step_{i}" style="width:100%; padding:10px; border-radius:10px;">
+              {opts_html}
+            </select>
+          </div>
+          <div style="margin-top:8px;">
+            Zeit (s):
+            <input type="number" id="time_{i}" value="0" style="width:100%; padding:10px; border-radius:10px;">
+          </div>
+        </div>
+        """
+
+    html = f"""
+    <html><head>
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Badlayout</title>
+      <style>
+        body {{ font-family:-apple-system, Arial; padding: 14px; }}
+        .top {{ display:flex; gap:10px; flex-wrap:wrap; }}
+        .card {{ border:1px solid #ddd; border-radius:14px; padding:14px; margin:12px 0; }}
+        .grid {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:12px; }}
+        .bath {{ border:1px solid #e5e5e5; border-radius:14px; padding:12px; }}
+        .bath-title {{ font-weight:700; margin-bottom:8px; }}
+        button {{ padding:12px 14px; border-radius:12px; border:1px solid #ccc; }}
+        .out {{ white-space:pre-wrap; font-family: ui-monospace, Menlo, monospace; }}
+        .reagent-row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid #eee; }}
+        .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; }}
+      </style>
+    </head>
+    <body>
+      <h2>Badlayout Screen</h2>
+
+      <div class="card top">
+        <div>
+          Protocol:
+          <select id="protocol_type" style="padding:10px; border-radius:10px;">
+            <option value="H&E">H&E</option>
+            <option value="Custom">Custom</option>
+          </select>
+        </div>
+        <div>Slides: <input id="slides" type="number" value="48" style="width:90px; padding:10px; border-radius:10px;"></div>
+        <div>Max Slides: <input id="max_slides" type="number" value="60" style="width:90px; padding:10px; border-radius:10px;"></div>
+        <div>Temp °C: <input id="temp" type="number" value="22" style="width:90px; padding:10px; border-radius:10px;"></div>
+        <div><a href="/" class="badge">Home</a></div>
+      </div>
+
+      <div class="card">
+        <h3>Stations / Baths</h3>
+        <div class="grid">
+          {station_cards}
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Reagents</h3>
+        {reagent_rows}
+      </div>
+
+      <div class="card">
+        <button onclick="preset_he()">Preset H&E</button>
+        <button onclick="preset_warn()">Preset WARN</button>
+        <button onclick="preset_block()">Preset BLOCK</button>
+        <button onclick="check_layout()">CHECK Layout</button>
+      </div>
+
+      <div class="card">
+        <h3>Result</h3>
+        <div id="result_badge" class="badge">⚪ (no check)</div>
+        <div id="out" class="out"></div>
+      </div>
+
+      <script>
+        function getBaths() {{
+          const baths = [];
+          for(let i=1;i<={stations};i++) {{
+            const step = document.getElementById('step_'+i).value;
+            const time = parseInt(document.getElementById('time_'+i).value || '0');
+            baths.push({{station:i, step:step, time_sec:time}});
+          }}
+          return baths;
+        }}
+
+        function getReagents() {{
+          return {{
+            "hematoxylin": {{
+              volume_ml: parseFloat(document.getElementById('r_hematoxylin_vol').value || '0'),
+              min_required_ml: parseFloat(document.getElementById('r_hematoxylin_min').value || '0')
+            }},
+            "eosin": {{
+              volume_ml: parseFloat(document.getElementById('r_eosin_vol').value || '0'),
+              min_required_ml: parseFloat(document.getElementById('r_eosin_min').value || '0')
+            }}
+          }};
+        }}
+
+        function setOverallBadge(overall) {{
+          const badge = document.getElementById('result_badge');
+          if(overall === "OK") badge.textContent = "🟢 OK";
+          else if(overall === "WARN") badge.textContent = "🟡 WARN";
+          else if(overall === "BLOCK") badge.textContent = "🔴 BLOCK";
+          else badge.textContent = "⚪ (no check)";
+        }}
+
+        async function check_layout() {{
+          const payload = {{
+            protocol_type: document.getElementById('protocol_type').value,
+            slides_loaded: parseInt(document.getElementById('slides').value || '0'),
+            max_slides_supported: parseInt(document.getElementById('max_slides').value || '0'),
+            temperature_c: parseFloat(document.getElementById('temp').value || '0'),
+            baths: getBaths(),
+            reagents: getReagents()
+          }};
+          const r = await fetch('/api/test_layout', {{
+            method: 'POST',
+            headers: {{'Content-Type':'application/json'}},
+            body: JSON.stringify(payload)
+          }});
+          const data = await r.json();
+          setOverallBadge(data.overall);
+          document.getElementById('out').textContent = JSON.stringify(data, null, 2);
+        }}
+
+        function clearAll() {{
+          for(let i=1;i<={stations};i++) {{
+            document.getElementById('step_'+i).value = "none";
+            document.getElementById('time_'+i).value = "0";
+          }}
+        }}
+
+        function preset_he() {{
+          document.getElementById('protocol_type').value = "H&E";
+          document.getElementById('slides').value = "48";
+          document.getElementById('max_slides').value = "60";
+          document.getElementById('temp').value = "22";
+          document.getElementById('r_hematoxylin_vol').value = "350";
+          document.getElementById('r_hematoxylin_min').value = "300";
+          document.getElementById('r_eosin_vol').value = "450";
+          document.getElementById('r_eosin_min').value = "300";
+
+          clearAll();
+          // Sequence on stations
+          const seq = [
+            ["deparaffinization",300],
+            ["hematoxylin",180],
+            ["rinse",60],
+            ["eosin",120],
+            ["dehydrate",240],
+            ["clear",180]
+          ];
+          for(let i=0;i<seq.length;i++) {{
+            document.getElementById('step_'+(i+1)).value = seq[i][0];
+            document.getElementById('time_'+(i+1)).value = seq[i][1];
+          }}
+        }}
+
+        function preset_warn() {{
+          preset_he();
+          document.getElementById('slides').value = "55";     // W201
+          document.getElementById('time_2').value = "90";     // W202 hematoxylin time
+        }}
+
+        function preset_block() {{
+          preset_he();
+          document.getElementById('slides').value = "70";     // E101
+          document.getElementById('r_hematoxylin_vol').value = "200"; // E301
+          // remove rinse
+          document.getElementById('step_3').value = "none";   // E202 + E201
+          document.getElementById('time_3').value = "0";
+        }}
+      </script>
+    </body></html>
+    """
+    return html
