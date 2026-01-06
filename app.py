@@ -303,17 +303,308 @@ def audit():
 
 @app.get("/layout", response_class=HTMLResponse)
 def layout():
-    # 8 Stationen als Demo-Badlayout
-    stations = 8
-    step_options = ["none","deparaffinization","hematoxylin","rinse","eosin","dehydrate","clear"]
+    # Gerät-nahes, schematisches Layout (U-Form), keine IFU-Kopie.
+    # Oben:  IN -> OVEN -> S1..S9 -> WATER
+    # U-turn
+    # Unten: S18..S10 -> OUT
 
+    stations_top = [
+        {"id": "IN", "label": "IN", "type": "input"},
+        {"id": "OVEN", "label": "OVEN", "type": "oven"},
+        *[{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(1, 10)],
+        {"id": "W1", "label": "WATER", "type": "water"},
+    ]
+    stations_bottom = [
+        *[{"id": f"S{i}", "label": f"S{i}", "type": "bath"} for i in range(18, 9, -1)],
+        {"id": "OUT", "label": "OUT", "type": "output"},
+    ]
+
+    # Traversal order for rules evaluation (the "process path")
+    path = ["OVEN"] + [f"S{i}" for i in range(1, 19)] + ["W1"]
+    # IN/OUT are not process steps, they’re transport I/O.
+
+    step_options = [
+        "none",
+        "deparaffinization",
+        "hematoxylin",
+        "rinse",
+        "eosin",
+        "dehydrate",
+        "clear",
+        "custom_step",
+    ]
     opts_html = "".join([f"<option value='{s}'>{s}</option>" for s in step_options])
 
-    # Default Reagents
+    # Default reagents (you can extend later)
     default_reagents = {
         "hematoxylin": {"volume_ml": 350, "min_required_ml": 300},
         "eosin": {"volume_ml": 450, "min_required_ml": 300},
     }
+
+    reagent_rows = ""
+    for name, r in default_reagents.items():
+        reagent_rows += f"""
+        <div class="reagent-row">
+          <div class="rname"><b>{name}</b></div>
+          <div>vol <input type="number" id="r_{name}_vol" value="{r['volume_ml']}" class="num"> ml</div>
+          <div>min <input type="number" id="r_{name}_min" value="{r['min_required_ml']}" class="num"> ml</div>
+        </div>
+        """
+
+    def station_tile(st):
+        # IN/OUT: no step/time
+        if st["type"] in ("input", "output"):
+            return f"""
+            <div class="tile {st['type']}" id="tile_{st['id']}">
+              <div class="title">{st['label']}</div>
+              <div class="sub">I/O</div>
+            </div>
+            """
+        # OVEN/WATER/BATH: step/time allowed
+        return f"""
+        <div class="tile {st['type']}" id="tile_{st['id']}">
+          <div class="title">{st['label']}</div>
+          <select id="step_{st['id']}" class="sel">{opts_html}</select>
+          <div class="row">
+            <span class="muted">Zeit (s)</span>
+            <input type="number" id="time_{st['id']}" value="0" class="num wide">
+          </div>
+        </div>
+        """
+
+    top_html = "".join([station_tile(s) for s in stations_top])
+    bottom_html = "".join([station_tile(s) for s in stations_bottom])
+
+    # JS arrays as literals
+    path_js = "[" + ",".join([f"'{p}'" for p in path]) + "]"
+
+    html = f"""
+    <html><head>
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Badlayout (Device-like)</title>
+      <style>
+        body {{ font-family:-apple-system, Arial; padding: 14px; }}
+        .card {{ border:1px solid #ddd; border-radius:14px; padding:14px; margin:12px 0; }}
+        .topbar {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+        .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; }}
+        .layout {{ overflow-x:auto; }}
+        .rowgrid {{
+          display:grid;
+          grid-auto-flow: column;
+          grid-auto-columns: 150px;
+          gap:10px;
+          padding: 10px 0;
+          align-items: start;
+        }}
+        .tile {{
+          border:1px solid #e5e5e5;
+          border-radius:14px;
+          padding:10px;
+          min-height: 140px;
+        }}
+        .title {{ font-weight:800; margin-bottom:8px; }}
+        .sub {{ color:#666; }}
+        .sel {{ width:100%; padding:10px; border-radius:10px; border:1px solid #ccc; }}
+        .row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:8px; }}
+        .muted {{ color:#666; font-size: 13px; }}
+        .num {{ padding:10px; border-radius:10px; border:1px solid #ccc; width:90px; }}
+        .num.wide {{ width:100%; }}
+
+        /* Station types (neutral, not IFU colors) */
+        .input  {{ background:#fafafa; }}
+        .output {{ background:#fafafa; }}
+        .oven   {{ background:#fff7f7; }}
+        .water  {{ background:#f6fbff; }}
+        .bath   {{ background:#ffffff; }}
+
+        /* Highlight result */
+        .ok {{ outline: 2px solid #2ecc71; }}
+        .warn {{ outline: 2px solid #f1c40f; }}
+        .block {{ outline: 2px solid #e74c3c; }}
+
+        .out {{ white-space:pre-wrap; font-family: ui-monospace, Menlo, monospace; }}
+        button {{ padding:12px 14px; border-radius:12px; border:1px solid #ccc; margin-right:8px; }}
+        .reagent-row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid #eee; }}
+        .rname {{ min-width:120px; }}
+      </style>
+    </head>
+    <body>
+      <h2>Badlayout (Device-like U-Shape)</h2>
+
+      <div class="card topbar">
+        <div>Protocol:
+          <select id="protocol_type" class="sel" style="width:auto;">
+            <option value="H&E">H&E</option>
+            <option value="Custom">Custom</option>
+          </select>
+        </div>
+        <div>Slides: <input id="slides" type="number" value="48" class="num"></div>
+        <div>Max Slides: <input id="max_slides" type="number" value="60" class="num"></div>
+        <div>Temp °C: <input id="temp" type="number" value="22" class="num"></div>
+        <a href="/" class="badge">Home</a>
+      </div>
+
+      <div class="card layout">
+        <div class="badge">Top row: IN → OVEN → S1…S9 → WATER</div>
+        <div class="rowgrid" id="toprow">{top_html}</div>
+
+        <div class="badge">Bottom row: S18…S10 → OUT</div>
+        <div class="rowgrid" id="bottomrow">{bottom_html}</div>
+      </div>
+
+      <div class="card">
+        <h3>Reagents</h3>
+        {reagent_rows}
+      </div>
+
+      <div class="card">
+        <button onclick="preset_he()">Preset H&E</button>
+        <button onclick="preset_warn()">Preset WARN</button>
+        <button onclick="preset_block()">Preset BLOCK</button>
+        <button onclick="check_layout()">CHECK Layout</button>
+      </div>
+
+      <div class="card">
+        <h3>Result</h3>
+        <div id="result_badge" class="badge">⚪ (no check)</div>
+        <div id="out" class="out"></div>
+      </div>
+
+      <script>
+        const PATH = {path_js};
+
+        function setOverallBadge(overall) {{
+          const badge = document.getElementById('result_badge');
+          if(overall === "OK") badge.textContent = "🟢 OK";
+          else if(overall === "WARN") badge.textContent = "🟡 WARN";
+          else if(overall === "BLOCK") badge.textContent = "🔴 BLOCK";
+          else badge.textContent = "⚪ (no check)";
+        }}
+
+        function clearHighlights() {{
+          const all = document.querySelectorAll('.tile');
+          all.forEach(t => {{
+            t.classList.remove('ok','warn','block');
+          }});
+        }}
+
+        function getBathsFromPath() {{
+          const baths = [];
+          for(const id of PATH) {{
+            const stepEl = document.getElementById('step_'+id);
+            const timeEl = document.getElementById('time_'+id);
+            if(!stepEl || !timeEl) continue;
+
+            const step = (stepEl.value || "none");
+            const time = parseInt(timeEl.value || "0");
+            baths.push({{station:id, step:step, time_sec:time}});
+          }}
+          return baths;
+        }}
+
+        function getReagents() {{
+          return {{
+            "hematoxylin": {{
+              volume_ml: parseFloat(document.getElementById('r_hematoxylin_vol').value || '0'),
+              min_required_ml: parseFloat(document.getElementById('r_hematoxylin_min').value || '0')
+            }},
+            "eosin": {{
+              volume_ml: parseFloat(document.getElementById('r_eosin_vol').value || '0'),
+              min_required_ml: parseFloat(document.getElementById('r_eosin_min').value || '0')
+            }}
+          }};
+        }}
+
+        async function check_layout() {{
+          clearHighlights();
+
+          const payload = {{
+            protocol_type: document.getElementById('protocol_type').value,
+            slides_loaded: parseInt(document.getElementById('slides').value || '0'),
+            max_slides_supported: parseInt(document.getElementById('max_slides').value || '0'),
+            temperature_c: parseFloat(document.getElementById('temp').value || '0'),
+            baths: getBathsFromPath(),
+            reagents: getReagents()
+          }};
+
+          const r = await fetch('/api/test_layout', {{
+            method: 'POST',
+            headers: {{'Content-Type':'application/json'}},
+            body: JSON.stringify(payload)
+          }});
+          const data = await r.json();
+          setOverallBadge(data.overall);
+          document.getElementById('out').textContent = JSON.stringify(data, null, 2);
+
+          // Simple highlight: mark used stations as OK/WARN/BLOCK based on overall
+          // (Next step: map specific findings to specific stations.)
+          const cls = (data.overall === "OK") ? "ok" : (data.overall === "WARN") ? "warn" : "block";
+          for(const b of payload.baths) {{
+            if(b.step && b.step !== "none" && b.time_sec > 0) {{
+              const t = document.getElementById('tile_'+b.station);
+              if(t) t.classList.add(cls);
+            }}
+          }}
+        }}
+
+        function clearAllStations() {{
+          for(const id of PATH) {{
+            const stepEl = document.getElementById('step_'+id);
+            const timeEl = document.getElementById('time_'+id);
+            if(stepEl) stepEl.value = "none";
+            if(timeEl) timeEl.value = "0";
+          }}
+        }}
+
+        function preset_he() {{
+          document.getElementById('protocol_type').value = "H&E";
+          document.getElementById('slides').value = "48";
+          document.getElementById('max_slides').value = "60";
+          document.getElementById('temp').value = "22";
+
+          document.getElementById('r_hematoxylin_vol').value = "350";
+          document.getElementById('r_hematoxylin_min').value = "300";
+          document.getElementById('r_eosin_vol').value = "450";
+          document.getElementById('r_eosin_min').value = "300";
+
+          clearAllStations();
+
+          // Put steps along early stations to match order
+          const seq = [
+            ["S1","deparaffinization",300],
+            ["S2","hematoxylin",180],
+            ["S3","rinse",60],
+            ["S4","eosin",120],
+            ["S5","dehydrate",240],
+            ["S6","clear",180],
+          ];
+          for(const [sid, step, t] of seq) {{
+            document.getElementById('step_'+sid).value = step;
+            document.getElementById('time_'+sid).value = String(t);
+          }}
+          // Optional: water station can be used for rinse too (if you want):
+          // document.getElementById('step_W1').value = "rinse";
+          // document.getElementById('time_W1').value = "60";
+        }}
+
+        function preset_warn() {{
+          preset_he();
+          document.getElementById('slides').value = "55"; // W201
+          document.getElementById('time_S2').value = "90"; // W202
+        }}
+
+        function preset_block() {{
+          preset_he();
+          document.getElementById('slides').value = "70"; // E101
+          document.getElementById('r_hematoxylin_vol').value = "200"; // E301
+          // Remove rinse
+          document.getElementById('step_S3').value = "none"; // E202 + E201
+          document.getElementById('time_S3').value = "0";
+        }}
+      </script>
+    </body></html>
+    """
+    return html }
 
     reagent_rows = ""
     for name, r in default_reagents.items():
