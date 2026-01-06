@@ -647,3 +647,69 @@ def api_program_delete(req: ProgramDeleteReq):
         return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
     if len(STATE["programs"]) <= 1:
         return JSONResponse({"
+
+
+   from fastapi.responses import HTMLResponse
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    cells = []
+    for bath in BATH_LAYOUT:
+        reagent = LAYOUT[bath]
+        if reagent:
+            cls = REAGENTS[reagent].reagent_class
+            color = REAGENT_CLASSES[cls]["color"]
+            label = reagent
+        else:
+            color = REAGENT_CLASSES["EMPTY"]["color"]
+            label = "EMPTY"
+
+        cells.append(f"""
+        <div class="cell" style="background:{color}">
+            <div class="bath">{bath}</div>
+            <div class="reagent">{label}</div>
+        </div>
+        """)
+
+    html = f"""
+    <html>
+    <head>
+        <title>CHROMAX ST – Demo UI</title>
+        <style>
+            body {{
+                font-family: system-ui, -apple-system;
+                background: #0f172a;
+                color: white;
+                padding: 20px;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(8, 1fr);
+                gap: 10px;
+                max-width: 1100px;
+            }}
+            .cell {{
+                border-radius: 10px;
+                padding: 10px;
+                text-align: center;
+                font-weight: 600;
+                box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
+            }}
+            .bath {{
+                font-size: 14px;
+            }}
+            .reagent {{
+                font-size: 12px;
+                opacity: 0.85;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>CHROMAX ST – Badlayout (Demo)</h1>
+        <div class="grid">
+            {''.join(cells)}
+        </div>
+    </body>
+    </html>
+    """
+    return html
