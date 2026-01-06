@@ -1,1 +1,1 @@
-# Badlayout-Chromax
+Chromax ST Demo Device – Web App
