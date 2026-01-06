@@ -1,26 +1,47 @@
+Verstanden: W1 und W2 sind nicht immer „fixe Wasserbäder“, sondern können optional als „R-Stationen“ (Reagenzstationen) genutzt werden. Dann dürfen sie nicht mehr WATER-Klasse erzwingen.
+
+Ich ändere die Logik so:
+	•	W3–W5 bleiben immer WATER (BLOCK wenn nicht WATER).
+	•	W1–W2 sind „Mode-switch“:
+	•	Mode = WATER → muss WATER-Klasse enthalten
+	•	Mode = REAGENT → darf jede Reagenzklasse enthalten (wie R-Station)
+	•	UI: neben dem Layout gibt’s einen kleinen Schalter W1/W2 Mode: WATER/REAGENT
+	•	Check-Regeln berücksichtigen das:
+	•	Wenn ein Schritt „rinse/wash/water“ auf W1 oder W2 liegt, dann muss W1/W2 Mode = WATER sein, sonst BLOCK.
+	•	Wenn W1/W2 Mode = REAGENT, dann gelten für W1/W2 die gleichen Klassenregeln wie bei R-Slots.
+
+Hier ist der Patch als kompletter neuer app.py (damit du nicht wieder in Klammer-Fehler läufst). Du kannst den von der letzten Version 1:1 ersetzen.
+
+⸻
+
+✅ Neuer kompletter app.py (mit W1/W2 umschaltbar)
+
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
-import json
-import re
+import json, re
 
-app = FastAPI(title="CHROMAX ST Demo — IFU Layout + Rules (v1)")
+app = FastAPI(title="CHROMAX ST Demo — IFU compatibility + W1/W2 switchable")
 
 DATA_FILE = Path("chromax_demo_data.json")
 
 # =========================================================
-# IFU bath schema (EXACT as your screenshot)
-# Top:    R1..R7, W1..W5, OVEN (top-right)
-# Bottom: R18..R8, LOAD (bottom-right)
+# IFU layout order (your screenshot)
+# TOP:    R1..R7, W1..W5, OVEN (top-right)
+# BOTTOM: R18..R8, LOAD (bottom-right)
 # =========================================================
 TOP_ROW = [f"R{i}" for i in range(1, 8)] + [f"W{i}" for i in range(1, 6)] + ["OVEN"]
 BOTTOM_ROW = [f"R{i}" for i in range(18, 7, -1)] + ["LOAD"]
 ALL_SLOTS = TOP_ROW + BOTTOM_ROW
 
-SLOT_KIND: Dict[str, str] = {
+TRANSPORT_ORDER = TOP_ROW + BOTTOM_ROW
+SLOT_POS = {s: i for i, s in enumerate(TRANSPORT_ORDER)}
+
+# Default physical kinds; W1/W2 can be overridden by STATE["w_mode"]
+SLOT_KIND_BASE: Dict[str, str] = {
     **{f"R{i}": "reagent" for i in range(1, 19)},
     **{f"W{i}": "water" for i in range(1, 6)},
     "OVEN": "oven",
@@ -28,58 +49,69 @@ SLOT_KIND: Dict[str, str] = {
 }
 
 # =========================================================
-# Helpers
+# helpers
 # =========================================================
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def is_valid_id(s: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9_\-]{2,32}", s or ""))
+
 def clamp_hex(s: str) -> str:
     s = (s or "").strip()
     if not s:
-        return "#64748b"
+        return ""
     if not s.startswith("#"):
         s = "#" + s
-    if re.fullmatch(r"#[0-9a-fA-F]{6}", s):
-        return s
-    return "#64748b"
+    return s if re.fullmatch(r"#[0-9a-fA-F]{6}", s) else ""
 
-def safe_write_json(path: Path, data: Dict[str, Any]) -> bool:
+def safe_read() -> Optional[Dict[str, Any]]:
     try:
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        return True
-    except Exception:
-        return False
-
-def safe_read_json(path: Path) -> Optional[Dict[str, Any]]:
-    try:
-        if not path.exists():
+        if not DATA_FILE.exists():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except Exception:
         return None
 
+def safe_write(data: Dict[str, Any]) -> None:
+    DATA_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+SEVERITY = {"OK": 1, "WARN": 2, "BLOCK": 3}
+def bump(cur: str, new: str) -> str:
+    return new if SEVERITY[new] > SEVERITY[cur] else cur
+
 # =========================================================
-# Defaults (Reagents, Layout, Programs)
+# predefined classes (colors fixed by class)
 # =========================================================
-DEFAULT_REAGENTS: Dict[str, Dict[str, Any]] = {
-    # id: {name, category, color}
-    "EMPTY": {"id": "EMPTY", "name": "Empty", "category": "EMPTY", "color": "#94a3b8"},
-    "WATER": {"id": "WATER", "name": "Water", "category": "WATER", "color": "#60a5fa"},
-    "XYLENE": {"id": "XYLENE", "name": "Xylene", "category": "XYLENE", "color": "#fbbf24"},
-    "ALC96": {"id": "ALC96", "name": "Alcohol 96%", "category": "ALCOHOL", "color": "#a78bfa"},
-    "ALC100": {"id": "ALC100", "name": "Alcohol 100%", "category": "ALCOHOL", "color": "#8b5cf6"},
-    "HEM": {"id": "HEM", "name": "Hematoxylin", "category": "HEMATOXYLIN", "color": "#22c55e"},
-    "EOS": {"id": "EOS", "name": "Eosin", "category": "EOSIN", "color": "#fb7185"},
-    "CLEAR": {"id": "CLEAR", "name": "Clearing", "category": "CLEAR", "color": "#f59e0b"},
-    "OVEN": {"id": "OVEN", "name": "Oven", "category": "OVEN", "color": "#f87171"},
-    "LOAD": {"id": "LOAD", "name": "Load", "category": "LOAD", "color": "#cbd5e1"},
+DEFAULT_CLASSES: Dict[str, Dict[str, str]] = {
+    "EMPTY": {"id":"EMPTY","name":"Empty","color":"#94a3b8"},
+    "WATER": {"id":"WATER","name":"Water","color":"#60a5fa"},
+    "ALCOHOL": {"id":"ALCOHOL","name":"Alcohol","color":"#a78bfa"},
+    "XYLENE": {"id":"XYLENE","name":"Xylene","color":"#fbbf24"},
+    "CLEARING": {"id":"CLEARING","name":"Clearing","color":"#f59e0b"},
+    "HEMATOXYLIN": {"id":"HEMATOXYLIN","name":"Hematoxylin","color":"#22c55e"},
+    "EOSIN": {"id":"EOSIN","name":"Eosin","color":"#fb7185"},
+    "OTHER": {"id":"OTHER","name":"Other","color":"#38bdf8"},
+    "OVEN": {"id":"OVEN","name":"Oven","color":"#f87171"},
+    "LOAD": {"id":"LOAD","name":"Load","color":"#cbd5e1"},
+}
+
+DEFAULT_REAGENTS: Dict[str, Dict[str, str]] = {
+    "EMPTY": {"id":"EMPTY","name":"Empty","class_id":"EMPTY","override_color":""},
+    "H2O": {"id":"H2O","name":"H₂O","class_id":"WATER","override_color":""},
+    "XYL": {"id":"XYL","name":"Xylene","class_id":"XYLENE","override_color":""},
+    "ALC96": {"id":"ALC96","name":"Alcohol 96%","class_id":"ALCOHOL","override_color":""},
+    "HEM": {"id":"HEM","name":"Hematoxylin","class_id":"HEMATOXYLIN","override_color":""},
+    "EOS": {"id":"EOS","name":"Eosin","class_id":"EOSIN","override_color":""},
+    "CLR": {"id":"CLR","name":"Clearing agent","class_id":"CLEARING","override_color":""},
+    "OVEN": {"id":"OVEN","name":"Oven","class_id":"OVEN","override_color":""},
+    "LOAD": {"id":"LOAD","name":"Load","class_id":"LOAD","override_color":""},
 }
 
 def default_layout() -> Dict[str, Dict[str, str]]:
     d = {slot: {"reagent_id": "EMPTY"} for slot in ALL_SLOTS}
-    # water stations W1..W5
     for w in [f"W{i}" for i in range(1, 6)]:
-        d[w] = {"reagent_id": "WATER"}
+        d[w] = {"reagent_id": "H2O"}
     d["OVEN"] = {"reagent_id": "OVEN"}
     d["LOAD"] = {"reagent_id": "LOAD"}
     return d
@@ -87,747 +119,549 @@ def default_layout() -> Dict[str, Dict[str, str]]:
 DEFAULT_PROGRAMS: Dict[str, Dict[str, Any]] = {
     "H&E": {
         "steps": [
-            {"name": "deparaffinization", "slot": "R1", "time_sec": 300},
-            {"name": "hematoxylin",       "slot": "R2", "time_sec": 180},
-            {"name": "rinse",             "slot": "W5", "time_sec": 60},
-            {"name": "eosin",             "slot": "R3", "time_sec": 120},
-            {"name": "dehydrate",         "slot": "R4", "time_sec": 240},
-            {"name": "clear",             "slot": "R5", "time_sec": 180},
+            {"name":"deparaffinization","slot":"R1","time_sec":300,"exact":True},
+            {"name":"hematoxylin","slot":"R2","time_sec":180,"exact":True},
+            {"name":"rinse","slot":"W5","time_sec":60,"exact":False},
+            {"name":"eosin","slot":"R3","time_sec":120,"exact":True},
+            {"name":"dehydrate","slot":"R4","time_sec":240,"exact":False},
+            {"name":"clear","slot":"R5","time_sec":180,"exact":False},
         ]
     },
-    "PAP": {"steps": [{"name": "custom_step", "slot": "R6", "time_sec": 60}]},
-    "CELLPROG": {"steps": [{"name": "custom_step", "slot": "R7", "time_sec": 60}]},
+    "PAP": {"steps":[{"name":"custom_step","slot":"R6","time_sec":60,"exact":False}]},
+    "CELLPROG": {"steps":[{"name":"custom_step","slot":"R7","time_sec":60,"exact":False}]},
 }
 
-# =========================================================
-# In-memory state + persistence
-# =========================================================
 STATE: Dict[str, Any] = {
+    "classes": dict(DEFAULT_CLASSES),
     "reagents": dict(DEFAULT_REAGENTS),
     "layout": default_layout(),
     "programs": dict(DEFAULT_PROGRAMS),
     "selected_program": "H&E",
+    "selected_for_run": ["H&E"],
+    "water_flow_l_min": 8.0,
+    # NEW: W1/W2 mode
+    # "WATER" => behaves as water slot
+    # "REAGENT" => behaves like R-station (reagent slot)
+    "w_mode": {"W1": "WATER", "W2": "WATER"},
     "last_check": None,
     "audit": [],
 }
 
 def persist():
-    # best-effort write
-    safe_write_json(DATA_FILE, {
+    safe_write({
+        "classes": STATE["classes"],
         "reagents": STATE["reagents"],
         "layout": STATE["layout"],
         "programs": STATE["programs"],
         "selected_program": STATE["selected_program"],
+        "selected_for_run": STATE["selected_for_run"],
+        "water_flow_l_min": STATE["water_flow_l_min"],
+        "w_mode": STATE["w_mode"],
     })
 
 def load_persisted():
-    data = safe_read_json(DATA_FILE)
+    data = safe_read()
     if not data:
         return
-    # merge safely
+    if isinstance(data.get("classes"), dict):
+        STATE["classes"] = data["classes"]
     if isinstance(data.get("reagents"), dict):
-        STATE["reagents"] = data["reagents"]
+        rg = {}
+        for rid, r in data["reagents"].items():
+            if not isinstance(r, dict):
+                continue
+            rid2 = (r.get("id") or rid).upper()
+            if not is_valid_id(rid2):
+                continue
+            cid = (r.get("class_id") or "OTHER").upper()
+            if cid not in STATE["classes"]:
+                cid = "OTHER"
+            rg[rid2] = {
+                "id": rid2,
+                "name": (r.get("name") or rid2),
+                "class_id": cid,
+                "override_color": clamp_hex(r.get("override_color") or ""),
+            }
+        for core_id, core in DEFAULT_REAGENTS.items():
+            rg.setdefault(core_id, core)
+        STATE["reagents"] = rg
+
     if isinstance(data.get("layout"), dict):
-        # only accept known slots
         lay = default_layout()
-        for k, v in data["layout"].items():
-            if k in lay and isinstance(v, dict) and "reagent_id" in v:
-                lay[k]["reagent_id"] = v["reagent_id"]
+        for slot, v in data["layout"].items():
+            if slot in lay and isinstance(v, dict):
+                rid = (v.get("reagent_id") or "EMPTY").upper()
+                if rid not in STATE["reagents"]:
+                    rid = "EMPTY"
+                lay[slot]["reagent_id"] = rid
         STATE["layout"] = lay
+
     if isinstance(data.get("programs"), dict):
-        STATE["programs"] = data["programs"]
-    if isinstance(data.get("selected_program"), str) and data["selected_program"] in STATE["programs"]:
-        STATE["selected_program"] = data["selected_program"]
+        progs = {}
+        for name, pv in data["programs"].items():
+            if not isinstance(pv, dict) or not isinstance(pv.get("steps"), list):
+                continue
+            steps = []
+            for s in pv["steps"]:
+                if not isinstance(s, dict):
+                    continue
+                steps.append({
+                    "name": (s.get("name") or "").strip(),
+                    "slot": (s.get("slot") or "").strip(),
+                    "time_sec": int(s.get("time_sec") or 0),
+                    "exact": bool(s.get("exact") or False),
+                })
+            progs[name] = {"steps": steps}
+        if progs:
+            STATE["programs"] = progs
+
+    sp = data.get("selected_program")
+    if isinstance(sp, str) and sp in STATE["programs"]:
+        STATE["selected_program"] = sp
+
+    sel = data.get("selected_for_run")
+    if isinstance(sel, list):
+        cleaned = [x for x in sel if isinstance(x, str) and x in STATE["programs"]]
+        STATE["selected_for_run"] = cleaned[:3] if cleaned else ["H&E"]
+
+    wf = data.get("water_flow_l_min")
+    try:
+        if wf is not None:
+            STATE["water_flow_l_min"] = float(wf)
+    except Exception:
+        pass
+
+    wm = data.get("w_mode")
+    if isinstance(wm, dict):
+        for k in ("W1", "W2"):
+            v = (wm.get(k) or "WATER").upper()
+            if v not in ("WATER", "REAGENT"):
+                v = "WATER"
+            STATE["w_mode"][k] = v
 
 def log(event: str, details: Dict[str, Any]):
     STATE["audit"].append({"t": now(), "event": event, "details": details})
-    if len(STATE["audit"]) > 600:
-        del STATE["audit"][:250]
+    if len(STATE["audit"]) > 800:
+        del STATE["audit"][:300]
 
 load_persisted()
-log("BOOT", {"slots_top": len(TOP_ROW), "slots_bottom": len(BOTTOM_ROW)})
+log("BOOT", {"layout": "IFU", "slots": len(ALL_SLOTS), "w_mode": STATE["w_mode"]})
 
 # =========================================================
-# Rules / Compatibility Engine
+# slot kind with W1/W2 override
 # =========================================================
-SEVERITY = {"OK": 1, "WARN": 2, "BLOCK": 3}
+def slot_kind(slot: str) -> str:
+    if slot in ("W1", "W2"):
+        mode = (STATE.get("w_mode", {}).get(slot) or "WATER").upper()
+        return "water" if mode == "WATER" else "reagent"
+    return SLOT_KIND_BASE.get(slot, "reagent")
 
-def bump(cur: str, new: str) -> str:
-    return new if SEVERITY[new] > SEVERITY[cur] else cur
+# =========================================================
+# class / reagent helpers
+# =========================================================
+def reagent_of_slot(slot: str) -> str:
+    return (STATE["layout"].get(slot) or {}).get("reagent_id", "EMPTY")
 
-# Step -> required slot kind
-STEP_REQUIRED_KIND = {
-    "rinse": "water",
-    "water": "water",
-    "oven": "oven",
-}
-
-# Step -> allowed reagent categories
-STEP_ALLOWED_CATEGORIES: Dict[str, List[str]] = {
-    "deparaffinization": ["XYLENE", "CLEAR", "OTHER"],
-    "hematoxylin":       ["HEMATOXYLIN", "OTHER"],
-    "eosin":             ["EOSIN", "OTHER"],
-    "dehydrate":         ["ALCOHOL", "OTHER"],
-    "clear":             ["XYLENE", "CLEAR", "OTHER"],
-    "rinse":             ["WATER"],
-    "custom_step":       ["OTHER", "EMPTY", "ALCOHOL", "XYLENE", "CLEAR", "HEMATOXYLIN", "EOSIN", "WATER"],
-}
-
-def reagent_category(reagent_id: str) -> str:
+def reagent_class(reagent_id: str) -> str:
     r = STATE["reagents"].get(reagent_id)
-    if not r:
-        return "UNKNOWN"
-    return (r.get("category") or "UNKNOWN").upper()
+    return (r.get("class_id") if r else "OTHER") or "OTHER"
 
-def slot_assigned_category(slot: str) -> str:
-    rid = (STATE["layout"].get(slot) or {}).get("reagent_id", "EMPTY")
-    return reagent_category(rid)
+def slot_class(slot: str) -> str:
+    return reagent_class(reagent_of_slot(slot))
 
-def run_check(program_name: str) -> Dict[str, Any]:
-    programs = STATE["programs"]
-    if program_name not in programs:
-        return {"program": program_name, "overall": "BLOCK",
-                "findings": [{"code": "E900", "level": "BLOCK", "message": "Program not found", "details": {}}]}
+# =========================================================
+# RULES
+# =========================================================
+WATER_STEPS = {"rinse", "water", "wash"}
+OVEN_STEPS = {"oven", "bake", "dry"}
 
-    steps = programs[program_name].get("steps", [])
+STEP_ALLOWED_CLASSES: Dict[str, List[str]] = {
+    "rinse": ["WATER"],
+    "water": ["WATER"],
+    "wash": ["WATER"],
+    "hematoxylin": ["HEMATOXYLIN", "OTHER"],
+    "eosin": ["EOSIN", "OTHER"],
+    "dehydrate": ["ALCOHOL", "OTHER"],
+    "clear": ["XYLENE", "CLEARING", "OTHER"],
+    "deparaffinization": ["XYLENE", "CLEARING", "OTHER"],
+    "custom_step": ["OTHER","ALCOHOL","XYLENE","CLEARING","HEMATOXYLIN","EOSIN","WATER","EMPTY"],
+}
+
+def check_layout_water_rules(findings: List[Dict[str, Any]]) -> str:
+    overall = "OK"
+
+    # W3..W5 always water
+    for w in ("W3", "W4", "W5"):
+        if slot_class(w) != "WATER":
+            findings.append({
+                "code": "E-WATER-CLASS",
+                "level": "BLOCK",
+                "message": f"{w} must contain WATER class reagent",
+                "details": {"slot": w, "slot_class": slot_class(w), "reagent": reagent_of_slot(w)}
+            })
+            overall = bump(overall, "BLOCK")
+
+    # W1/W2: depends on mode
+    for w in ("W1", "W2"):
+        mode = (STATE["w_mode"].get(w) or "WATER").upper()
+        if mode == "WATER":
+            if slot_class(w) != "WATER":
+                findings.append({
+                    "code": "E-W12-WATER",
+                    "level": "BLOCK",
+                    "message": f"{w} is in WATER mode and must contain WATER class reagent",
+                    "details": {"slot": w, "mode": mode, "slot_class": slot_class(w), "reagent": reagent_of_slot(w)}
+                })
+                overall = bump(overall, "BLOCK")
+        else:
+            # REAGENT mode: no water-class requirement
+            pass
+
+    # flow warning
+    if float(STATE.get("water_flow_l_min") or 0) < 8.0:
+        findings.append({
+            "code": "W-WATER-FLOW",
+            "level": "WARN",
+            "message": "Water flow < 8 L/min: wash time may need extension",
+            "details": {"water_flow_l_min": STATE.get("water_flow_l_min")}
+        })
+        overall = bump(overall, "WARN")
+
+    return overall
+
+def check_program(program_name: str) -> Dict[str, Any]:
+    p = STATE["programs"].get(program_name)
     findings: List[Dict[str, Any]] = []
     overall = "OK"
 
-    # Track order positions for order rules
-    positions: Dict[str, int] = {}
+    if not p:
+        return {"program": program_name, "overall": "BLOCK",
+                "findings":[{"code":"E-NOTFOUND","level":"BLOCK","message":"Program not found","details":{}}]}
 
-    for idx, st in enumerate(steps, start=1):
-        name = (st.get("name") or "").strip()
-        slot = (st.get("slot") or "").strip()
-        t = int(st.get("time_sec") or 0)
+    steps = p.get("steps") or []
+    if not steps:
+        findings.append({"code":"W-EMPTY-PROG","level":"WARN","message":"Program has no steps","details":{}})
+        overall = bump(overall, "WARN")
+
+    # not backwards across transport order
+    last_pos = -1
+    for i, s in enumerate(steps, start=1):
+        name = (s.get("name") or "").strip()
+        slot = (s.get("slot") or "").strip()
+        t = int(s.get("time_sec") or 0)
 
         if not name:
-            findings.append({"code": "E910", "level": "BLOCK", "message": "Empty step name", "details": {"step_index": idx}})
+            findings.append({"code":"E-STEP-NAME","level":"BLOCK","message":"Empty step name","details":{"step": i}})
             overall = bump(overall, "BLOCK")
             continue
 
-        positions.setdefault(name, idx)
-
-        if slot not in STATE["layout"]:
-            findings.append({"code": "E401", "level": "BLOCK", "message": "Unknown slot", "details": {"step": name, "slot": slot}})
+        if slot not in SLOT_POS:
+            findings.append({"code":"E-SLOT","level":"BLOCK","message":"Unknown slot","details":{"step": i,"slot": slot}})
             overall = bump(overall, "BLOCK")
             continue
 
         if t <= 0:
-            findings.append({"code": "W910", "level": "WARN", "message": "Time <= 0", "details": {"step": name, "slot": slot, "time_sec": t}})
+            findings.append({"code":"W-TIME","level":"WARN","message":"Time <= 0","details":{"step": i,"slot": slot,"time_sec": t}})
             overall = bump(overall, "WARN")
 
-        # kind rule
-        req_kind = STEP_REQUIRED_KIND.get(name)
-        if req_kind:
-            actual_kind = SLOT_KIND.get(slot, "reagent")
-            if actual_kind != req_kind:
-                findings.append({"code": "E402", "level": "BLOCK", "message": "Step on wrong slot kind",
-                                 "details": {"step": name, "slot": slot, "required_kind": req_kind, "actual_kind": actual_kind}})
+        # reverse rule
+        pos = SLOT_POS[slot]
+        if pos < last_pos:
+            findings.append({
+                "code": "E-REVERSE",
+                "level": "BLOCK",
+                "message": "Program contains stations in reverse order (not allowed)",
+                "details": {"step": i, "slot": slot, "pos": pos, "previous_pos": last_pos}
+            })
+            overall = bump(overall, "BLOCK")
+        last_pos = max(last_pos, pos)
+
+        # water step must be on a slot that is CURRENTLY water-kind
+        if name in WATER_STEPS:
+            if slot_kind(slot) != "water":
+                findings.append({
+                    "code":"E-KIND-WATER",
+                    "level":"BLOCK",
+                    "message":"Water step must be on a water slot (W-mode must be WATER)",
+                    "details":{"step":i,"name":name,"slot":slot,"slot_kind":slot_kind(slot),"w_mode":STATE.get("w_mode",{})}
+                })
+                overall = bump(overall, "BLOCK")
+            # and class must be water
+            if slot_class(slot) != "WATER":
+                findings.append({
+                    "code":"E-CLASS-WATER",
+                    "level":"BLOCK",
+                    "message":"Water step requires WATER class in that station",
+                    "details":{"step":i,"slot":slot,"slot_class":slot_class(slot),"reagent":reagent_of_slot(slot)}
+                })
                 overall = bump(overall, "BLOCK")
 
-        # category rule
-        allowed = STEP_ALLOWED_CATEGORIES.get(name)
-        if allowed:
-            cat = slot_assigned_category(slot)
-            if cat == "EMPTY":
-                findings.append({"code": "W401", "level": "WARN", "message": "Slot is Empty", "details": {"step": name, "slot": slot}})
-                overall = bump(overall, "WARN")
-            elif cat not in allowed and "OTHER" not in allowed:
-                findings.append({"code": "E403", "level": "BLOCK", "message": "Reagent category mismatch",
-                                 "details": {"step": name, "slot": slot, "slot_category": cat, "allowed": allowed}})
-                overall = bump(overall, "BLOCK")
-
-    # Program-specific rules (extendable)
-    if program_name == "H&E":
-        # must contain rinse
-        if not any((s.get("name") == "rinse") for s in steps):
-            findings.append({"code": "E202", "level": "BLOCK", "message": "H&E requires rinse step", "details": {}})
+        # oven step on OVEN
+        if name in OVEN_STEPS and slot != "OVEN":
+            findings.append({"code":"E-KIND-OVEN","level":"BLOCK","message":"Oven step must be on OVEN",
+                             "details":{"step":i,"name":name,"slot":slot}})
             overall = bump(overall, "BLOCK")
 
-        # order: hematoxylin before eosin
-        if "hematoxylin" in positions and "eosin" in positions:
-            if positions["hematoxylin"] > positions["eosin"]:
-                findings.append({"code": "E203", "level": "BLOCK", "message": "H&E order invalid (hematoxylin must be before eosin)",
-                                 "details": {"hematoxylin_pos": positions["hematoxylin"], "eosin_pos": positions["eosin"]}})
+        # general class check
+        allowed = STEP_ALLOWED_CLASSES.get(name)
+        if allowed and name not in WATER_STEPS:
+            sc = slot_class(slot)
+            if sc == "EMPTY":
+                findings.append({"code":"W-EMPTY-SLOT","level":"WARN","message":"Slot is EMPTY",
+                                 "details":{"step":i,"slot":slot}})
+                overall = bump(overall, "WARN")
+            elif sc not in allowed:
+                findings.append({"code":"E-CLASS","level":"BLOCK","message":"Reagent class mismatch",
+                                 "details":{"step":i,"name":name,"slot":slot,"slot_class":sc,"allowed":allowed}})
                 overall = bump(overall, "BLOCK")
 
     return {"program": program_name, "overall": overall, "findings": findings}
+
+def exact_station_conflict(p1_steps: List[Dict[str, Any]], p2_steps: List[Dict[str, Any]]) -> Optional[str]:
+    p1_exact = set(s.get("slot") for s in p1_steps if s.get("exact") and s.get("slot") in SLOT_POS)
+    p2_exact = set(s.get("slot") for s in p2_steps if s.get("exact") and s.get("slot") in SLOT_POS)
+    both = p1_exact.intersection(p2_exact)
+    return sorted(list(both))[0] if both else None
+
+def reverse_order_conflict(p1_steps: List[Dict[str, Any]], p2_steps: List[Dict[str, Any]]) -> Optional[Tuple[str,str]]:
+    p1_order = [s.get("slot") for s in p1_steps if (s.get("slot") in SLOT_POS)]
+    p2_order = [s.get("slot") for s in p2_steps if (s.get("slot") in SLOT_POS)]
+    common = [s for s in p1_order if s in set(p2_order)]
+    for i in range(len(common)):
+        for j in range(i+1, len(common)):
+            a, b = common[i], common[j]
+            if p1_order.index(a) < p1_order.index(b) and p2_order.index(a) > p2_order.index(b):
+                return (a,b)
+            if p1_order.index(a) > p1_order.index(b) and p2_order.index(a) < p2_order.index(b):
+                return (a,b)
+    return None
+
+def check_multi(selected: List[str]) -> Dict[str, Any]:
+    overall = "OK"
+    findings: List[Dict[str, Any]] = []
+    per_program: List[Dict[str, Any]] = []
+
+    overall = bump(overall, check_layout_water_rules(findings))
+
+    for p in selected:
+        r = check_program(p)
+        per_program.append(r)
+        overall = bump(overall, r["overall"])
+        for f in r["findings"]:
+            findings.append({**f, "program": p})
+
+    for i in range(len(selected)):
+        for j in range(i+1, len(selected)):
+            p1, p2 = selected[i], selected[j]
+            s1 = (STATE["programs"].get(p1) or {}).get("steps") or []
+            s2 = (STATE["programs"].get(p2) or {}).get("steps") or []
+
+            ex = exact_station_conflict(s1, s2)
+            if ex:
+                findings.append({
+                    "code": "E-EXACT-CONFLICT",
+                    "level": "BLOCK",
+                    "message": "Exact station conflict between programs",
+                    "details": {"program_1": p1, "program_2": p2, "station": ex},
+                    "program": f"{p1} + {p2}",
+                })
+                overall = bump(overall, "BLOCK")
+
+            rev = reverse_order_conflict(s1, s2)
+            if rev:
+                findings.append({
+                    "code": "E-REVERSE-CONFLICT",
+                    "level": "BLOCK",
+                    "message": "Reverse station order conflict between programs",
+                    "details": {"program_1": p1, "program_2": p2, "stations": list(rev)},
+                    "program": f"{p1} + {p2}",
+                })
+                overall = bump(overall, "BLOCK")
+
+    STATE["last_check"] = {"overall": overall, "findings": findings, "per_program": per_program, "selected": selected}
+    persist()
+    log("CHECK", {"selected": selected, "overall": overall, "n": len(findings)})
+    return STATE["last_check"]
 
 # =========================================================
 # API models
 # =========================================================
 class LayoutSaveReq(BaseModel):
-    layout: Dict[str, str]  # slot -> reagent_id
+    layout: Dict[str, str]
+
+class WaterFlowReq(BaseModel):
+    water_flow_l_min: float
+
+class WModeReq(BaseModel):
+    W1: str
+    W2: str
+
+class ClassUpsertReq(BaseModel):
+    class_id: str
+    name: str
+    color: str
+
+class ClassDeleteReq(BaseModel):
+    class_id: str
 
 class ReagentUpsertReq(BaseModel):
     reagent_id: str
     name: str
-    category: str
-    color: str
+    class_id: str
+    override_color: Optional[str] = ""
 
 class ReagentDeleteReq(BaseModel):
     reagent_id: str
 
+class ProgramCreateReq(BaseModel):
+    name: str
+
+class ProgramDeleteReq(BaseModel):
+    name: str
+
+class ProgramRenameReq(BaseModel):
+    old_name: str
+    new_name: str
+
 class ProgramSelectReq(BaseModel):
-    program: str
+    name: str
+
+class RunSelectReq(BaseModel):
+    selected: List[str]
 
 class StepModel(BaseModel):
     name: str
     slot: str
     time_sec: int
+    exact: bool = False
 
 class ProgramSaveReq(BaseModel):
-    program: str
+    name: str
     steps: List[StepModel]
 
 # =========================================================
-# APIs
+# API endpoints
 # =========================================================
 @app.get("/api/state")
 def api_state():
     return {
+        "classes": STATE["classes"],
         "reagents": STATE["reagents"],
         "layout": STATE["layout"],
         "programs": STATE["programs"],
         "selected_program": STATE["selected_program"],
+        "selected_for_run": STATE["selected_for_run"],
+        "water_flow_l_min": STATE["water_flow_l_min"],
+        "w_mode": STATE["w_mode"],
         "last_check": STATE["last_check"],
     }
+
+@app.post("/api/waterflow")
+def api_waterflow(req: WaterFlowReq):
+    try:
+        STATE["water_flow_l_min"] = float(req.water_flow_l_min)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid water_flow_l_min"}, status_code=400)
+    persist()
+    log("WATERFLOW", {"water_flow_l_min": STATE["water_flow_l_min"]})
+    return {"ok": True}
+
+@app.post("/api/wmode")
+def api_wmode(req: WModeReq):
+    w1 = (req.W1 or "WATER").upper()
+    w2 = (req.W2 or "WATER").upper()
+    if w1 not in ("WATER","REAGENT") or w2 not in ("WATER","REAGENT"):
+        return JSONResponse({"ok": False, "error": "W1/W2 must be WATER or REAGENT"}, status_code=400)
+    STATE["w_mode"]["W1"] = w1
+    STATE["w_mode"]["W2"] = w2
+    persist()
+    log("WMODE", {"W1": w1, "W2": w2})
+    return {"ok": True}
 
 @app.post("/api/layout/save")
 def api_layout_save(req: LayoutSaveReq):
     for slot, rid in req.layout.items():
         if slot not in STATE["layout"]:
             return JSONResponse({"ok": False, "error": f"Unknown slot {slot}"}, status_code=400)
+        rid = (rid or "EMPTY").upper()
         if rid not in STATE["reagents"]:
             rid = "EMPTY"
         STATE["layout"][slot]["reagent_id"] = rid
+    persist()
     log("SAVE_LAYOUT", {"n": len(req.layout)})
+    return {"ok": True}
+
+@app.post("/api/classes/upsert")
+def api_class_upsert(req: ClassUpsertReq):
+    cid = (req.class_id or "").strip().upper()
+    if not is_valid_id(cid):
+        return JSONResponse({"ok": False, "error": "Invalid class_id"}, status_code=400)
+    color = clamp_hex(req.color) or "#94a3b8"
+    STATE["classes"][cid] = {"id": cid, "name": (req.name or cid).strip() or cid, "color": color}
+    persist()
+    return {"ok": True}
+
+@app.post("/api/classes/delete")
+def api_class_delete(req: ClassDeleteReq):
+    cid = (req.class_id or "").strip().upper()
+    if cid in ("EMPTY", "WATER", "OVEN", "LOAD"):
+        return JSONResponse({"ok": False, "error": "Core class cannot be deleted"}, status_code=400)
+    if cid not in STATE["classes"]:
+        return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
+    for rid, r in STATE["reagents"].items():
+        if r.get("class_id") == cid:
+            r["class_id"] = "OTHER"
+    del STATE["classes"][cid]
     persist()
     return {"ok": True}
 
 @app.post("/api/reagents/upsert")
-def api_reagents_upsert(req: ReagentUpsertReq):
+def api_reagent_upsert(req: ReagentUpsertReq):
     rid = (req.reagent_id or "").strip().upper()
-    if not rid:
-        return JSONResponse({"ok": False, "error": "reagent_id required"}, status_code=400)
-    if rid in ("OVEN", "LOAD", "WATER", "EMPTY"):
-        # allow edit color/name/category for demo, but keep them present
-        pass
+    if not is_valid_id(rid):
+        return JSONResponse({"ok": False, "error": "Invalid reagent_id"}, status_code=400)
+    cid = (req.class_id or "OTHER").strip().upper()
+    if cid not in STATE["classes"]:
+        return JSONResponse({"ok": False, "error": f"Unknown class_id {cid}"}, status_code=400)
     STATE["reagents"][rid] = {
         "id": rid,
-        "name": (req.name or "").strip() or rid,
-        "category": (req.category or "").strip().upper() or "OTHER",
-        "color": clamp_hex(req.color),
+        "name": (req.name or rid).strip() or rid,
+        "class_id": cid,
+        "override_color": clamp_hex(req.override_color or ""),
     }
-    log("UPSERT_REAGENT", {"id": rid})
     persist()
     return {"ok": True}
 
 @app.post("/api/reagents/delete")
-def api_reagents_delete(req: ReagentDeleteReq):
+def api_reagent_delete(req: ReagentDeleteReq):
     rid = (req.reagent_id or "").strip().upper()
-    if rid in ("OVEN", "LOAD", "WATER", "EMPTY"):
-        return JSONResponse({"ok": False, "error": "core reagent cannot be deleted"}, status_code=400)
+    if rid in ("EMPTY", "H2O", "OVEN", "LOAD"):
+        return JSONResponse({"ok": False, "error": "Core reagent cannot be deleted"}, status_code=400)
     if rid not in STATE["reagents"]:
-        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-
-    # unassign from layout
-    for slot in STATE["layout"].keys():
+        return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
+    for slot in STATE["layout"]:
         if STATE["layout"][slot]["reagent_id"] == rid:
             STATE["layout"][slot]["reagent_id"] = "EMPTY"
-
     del STATE["reagents"][rid]
-    log("DELETE_REAGENT", {"id": rid})
     persist()
     return {"ok": True}
 
-@app.post("/api/program/select")
-def api_program_select(req: ProgramSelectReq):
-    if req.program not in STATE["programs"]:
-        return JSONResponse({"ok": False, "error": "program not found"}, status_code=404)
-    STATE["selected_program"] = req.program
-    log("SELECT_PROGRAM", {"program": req.program})
+@app.post("/api/program/create")
+def api_program_create(req: ProgramCreateReq):
+    name = (req.name or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "Name required"}, status_code=400)
+    if name in STATE["programs"]:
+        return JSONResponse({"ok": False, "error": "Already exists"}, status_code=400)
+    STATE["programs"][name] = {"steps": []}
+    STATE["selected_program"] = name
     persist()
     return {"ok": True}
 
-@app.post("/api/program/save")
-def api_program_save(req: ProgramSaveReq):
-    if req.program not in STATE["programs"]:
-        return JSONResponse({"ok": False, "error": "program not found"}, status_code=404)
-    STATE["programs"][req.program] = {"steps": [s.model_dump() for s in req.steps]}
-    log("SAVE_PROGRAM", {"program": req.program, "n_steps": len(req.steps)})
-    persist()
-    return {"ok": True}
-
-@app.post("/api/check")
-def api_check():
-    prog = STATE["selected_program"]
-    res = run_check(prog)
-    STATE["last_check"] = res
-    log("CHECK", {"program": prog, "overall": res["overall"], "n": len(res["findings"])})
-    persist()
-    return res
-
-@app.get("/audit", response_class=PlainTextResponse)
-def audit():
-    lines = ["AUDIT (last 300)"]
-    for e in STATE["audit"][-300:]:
-        lines.append(f"{e['t']} | {e['event']} | {e['details']}")
-    return PlainTextResponse("\n".join(lines))
-
-# =========================================================
-# UI — IFU-like: center baths, right programs panel
-# =========================================================
-@app.get("/", response_class=HTMLResponse)
-def ui():
-    def tile(slot: str) -> str:
-        return (
-            f"<div class='tile' id='tile_{slot}'>"
-            f"  <div class='slot'>{slot}</div>"
-            f"  <select class='sel' id='sel_{slot}'></select>"
-            f"</div>"
-        )
-
-    top_html = "".join(tile(s) for s in TOP_ROW)
-    bottom_html = "".join(tile(s) for s in BOTTOM_ROW)
-    top_js = "[" + ",".join([f"'{s}'" for s in TOP_ROW]) + "]"
-    bottom_js = "[" + ",".join([f"'{s}'" for s in BOTTOM_ROW]) + "]"
-
-    tpl = """
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>CHROMAX ST Demo</title>
-<style>
-:root{
-  --bg:#0b1220; --text:#eaf0ff; --muted:rgba(234,240,255,.75);
-  --stroke:rgba(255,255,255,.12); --card:rgba(255,255,255,.04);
-  --btn:rgba(255,255,255,.06); --accent:#7aa2ff;
-  --ok:#2ecc71; --warn:#f1c40f; --block:#e74c3c;
-  --tileW: 102px; /* make narrower here */
-}
-*{box-sizing:border-box}
-body{
-  font-family:-apple-system,system-ui,Arial;
-  margin:0;padding:14px;color:var(--text);
-  background:
-    radial-gradient(1200px 800px at 20% 0%, rgba(122,162,255,.20), transparent 55%),
-    radial-gradient(900px 600px at 80% 20%, rgba(46,204,113,.12), transparent 60%),
-    var(--bg);
-}
-a{color:var(--accent);text-decoration:none}
-
-.grid{
-  display:grid;
-  grid-template-columns: 1.35fr .65fr;
-  gap:12px;
-}
-@media (max-width: 980px){
-  .grid{ grid-template-columns:1fr; }
-}
-.card{
-  border:1px solid var(--stroke);
-  border-radius:16px;
-  background:var(--card);
-  padding:12px;
-}
-.sectionTitle{ font-weight:1000; letter-spacing:.3px; font-size:13px; color:var(--muted); margin-bottom:8px; }
-.hint{ color:var(--muted); font-size:12px; line-height:1.4; }
-
-.row{
-  display:grid;
-  grid-auto-flow:column;
-  grid-auto-columns: var(--tileW);
-  gap:8px;
-  overflow-x:auto;
-  padding:8px 0;
-}
-.tile{
-  border:1px solid rgba(255,255,255,.12);
-  border-radius:14px;
-  padding:10px;
-  min-height:78px;
-  background:rgba(255,255,255,.03);
-}
-.slot{ font-weight:1000; margin-bottom:6px; font-size:12px; }
-.sel{
-  width:100%;
-  padding:7px 8px;
-  border-radius:12px;
-  border:1px solid rgba(255,255,255,.12);
-  background:rgba(0,0,0,.18);
-  color:var(--text);
-  outline:none;
-  font-size:12px;
-}
-.sel:focus{ border-color:rgba(122,162,255,.55); box-shadow:0 0 0 4px rgba(122,162,255,.12); }
-
-button{
-  padding:11px 12px;
-  border-radius:14px;
-  border:1px solid var(--stroke);
-  background:var(--btn);
-  color:var(--text);
-  font-weight:1000;
-  font-size:13px;
-}
-button.primary{ border-color:rgba(122,162,255,.55); background:rgba(122,162,255,.18); }
-
-.badge{ padding:8px 10px; border-radius:999px; border:1px solid var(--stroke); background:rgba(255,255,255,.04); color:var(--muted); font-size:12px; display:inline-block; }
-.badge.ok{ border-color:rgba(46,204,113,.35); background:rgba(46,204,113,.10); color:var(--ok); }
-.badge.warn{ border-color:rgba(241,196,15,.35); background:rgba(241,196,15,.10); color:var(--warn); }
-.badge.block{ border-color:rgba(231,76,60,.35); background:rgba(231,76,60,.12); color:var(--block); }
-
-.finding{
-  margin-top:8px;
-  border:1px solid rgba(255,255,255,.10);
-  border-radius:14px;
-  background:rgba(0,0,0,.12);
-  padding:10px;
-  white-space:pre-wrap;
-  font-family:ui-monospace, Menlo, monospace;
-  font-size:12px;
-  color:var(--muted);
-}
-
-.item{
-  display:flex; justify-content:space-between; align-items:center; gap:10px;
-  padding:10px 10px; border-radius:14px;
-  border:1px solid rgba(255,255,255,.10);
-  background:rgba(255,255,255,.04);
-  font-size:13px;
-  margin-bottom:8px;
-}
-.item.active{ border-color:rgba(122,162,255,.55); background:rgba(122,162,255,.14); }
-.smallbtn{ padding:8px 10px; border-radius:12px; font-size:12px; font-weight:900; }
-
-.editorRow{
-  display:grid;
-  grid-template-columns: 1.15fr .65fr .55fr .25fr;
-  gap:8px;
-  align-items:center;
-  margin-bottom:8px;
-}
-.editorRow input{
-  font-size:12px; padding:7px 8px; border-radius:12px;
-  border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.05); color:var(--text);
-}
-.editorRow .del{
-  cursor:pointer; text-align:center;
-  border:1px solid rgba(255,255,255,.12);
-  border-radius:12px;
-  padding:7px 0;
-  background:rgba(231,76,60,.10);
-}
-
-.formRow{
-  display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:8px;
-  margin-top:10px;
-}
-.formRow input{
-  font-size:12px; padding:7px 8px; border-radius:12px;
-  border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.05); color:var(--text);
-}
-</style>
-</head>
-<body>
-
-<div class="grid">
-
-  <!-- LEFT: Baths -->
-  <div class="card">
-    <div class="sectionTitle">IFU Bath layout</div>
-    <div class="hint">Top: R1–R7, W1–W5, OVEN • Bottom: R18–R8, LOAD</div>
-
-    <div class="row" id="row_top">__TOP__</div>
-    <div class="row" id="row_bottom">__BOTTOM__</div>
-
-    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:8px;">
-      <button onclick="saveLayout()" class="primary">Save layout</button>
-      <button onclick="check()" class="primary">Check compatibility</button>
-      <a class="badge" href="/audit">Audit</a>
-      <span class="badge" id="badge">⚪ no check</span>
-    </div>
-
-    <div class="finding" id="msg_left">Ready.</div>
-  </div>
-
-  <!-- RIGHT: Programs + Reagents -->
-  <div class="card">
-    <div class="sectionTitle">Programs (right panel)</div>
-    <div id="program_list"></div>
-
-    <div class="sectionTitle">Protocol editor</div>
-    <div id="step_editor"></div>
-    <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <button onclick="addStep()">+ Step</button>
-      <button onclick="saveProgram()" class="primary">Save program</button>
-    </div>
-
-    <div style="height:12px"></div>
-
-    <div class="sectionTitle">Reagents</div>
-    <div class="hint">Reagent ID (z.B. ALC70), Name, Kategorie (ALCOHOL/XYLENE/...), Farbe (#RRGGBB)</div>
-
-    <div class="formRow">
-      <input id="rg_id" placeholder="Reagent ID (e.g. ALC70)" />
-      <input id="rg_name" placeholder="Name" />
-      <input id="rg_cat" placeholder="Category (e.g. ALCOHOL)" />
-      <input id="rg_col" placeholder="Color (e.g. #a78bfa)" />
-    </div>
-
-    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
-      <button onclick="upsertReagent()" class="primary">Add/Update reagent</button>
-      <button onclick="deleteReagent()">Delete reagent</button>
-    </div>
-
-    <div class="finding" id="msg_right">Ready.</div>
-  </div>
-
-</div>
-
-<script>
-const TOP = __TOPSLOTS__;
-const BOTTOM = __BOTTOMSLOTS__;
-const ALL = TOP.concat(BOTTOM);
-
-let STATE = null;
-
-function hexToRgba(hex, a){
-  const h = (hex||"").replace("#","");
-  if(h.length !== 6) return "rgba(148,163,184,"+a+")";
-  const r = parseInt(h.slice(0,2),16);
-  const g = parseInt(h.slice(2,4),16);
-  const b = parseInt(h.slice(4,6),16);
-  return `rgba(${r},${g},${b},${a})`;
-}
-
-function setBadge(overall){
-  const b = document.getElementById('badge');
-  b.classList.remove('ok','warn','block');
-  if(overall==="OK"){ b.textContent="🟢 OK"; b.classList.add('ok'); }
-  else if(overall==="WARN"){ b.textContent="🟡 WARN"; b.classList.add('warn'); }
-  else if(overall==="BLOCK"){ b.textContent="🔴 BLOCK"; b.classList.add('block'); }
-  else { b.textContent="⚪ no check"; }
-}
-
-async function loadState(){
-  const r = await fetch('/api/state');
-  STATE = await r.json();
-  renderBaths();
-  renderPrograms();
-  renderSteps();
-}
-
-function reagentOptionsHtml(selectedId){
-  const reag = STATE.reagents;
-  const ids = Object.keys(reag).sort();
-  return ids.map(id=>{
-    const nm = reag[id].name || id;
-    const sel = (id===selectedId) ? "selected" : "";
-    return `<option value="${id}" ${sel}>${nm} (${id})</option>`;
-  }).join("");
-}
-
-function applyTileColor(slot, reagentId){
-  const tile = document.getElementById('tile_'+slot);
-  const r = STATE.reagents[reagentId];
-  const col = r ? r.color : "#94a3b8";
-  tile.style.background = `linear-gradient(180deg, ${hexToRgba(col,0.30)}, ${hexToRgba(col,0.10)})`;
-}
-
-function renderBaths(){
-  // fill selects + bind onchange to update color immediately
-  ALL.forEach(slot=>{
-    const sel = document.getElementById('sel_'+slot);
-    const rid = (STATE.layout[slot] && STATE.layout[slot].reagent_id) ? STATE.layout[slot].reagent_id : "EMPTY";
-    sel.innerHTML = reagentOptionsHtml(rid);
-    applyTileColor(slot, rid);
-    sel.onchange = ()=> {
-      applyTileColor(slot, sel.value);
-      document.getElementById('msg_left').textContent = "Changed " + slot + " -> " + sel.value + " (not saved yet)";
-    };
-  });
-}
-
-function renderPrograms(){
-  const wrap = document.getElementById('program_list');
-  const names = Object.keys(STATE.programs).sort();
-  wrap.innerHTML = "";
-  names.forEach(n=>{
-    const cls = (n===STATE.selected_program) ? "item active" : "item";
-    wrap.insertAdjacentHTML('beforeend', `
-      <div class="${cls}">
-        <div><b>${n}</b></div>
-        <button class="smallbtn" onclick="selectProgram('${n.replace(/'/g,"\\'")}')">Open</button>
-      </div>
-    `);
-  });
-}
-
-async function selectProgram(name){
-  await fetch('/api/program/select', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({program:name})
-  });
-  await loadState();
-  document.getElementById('msg_right').textContent = "Selected program: " + STATE.selected_program;
-}
-
-function renderSteps(){
-  const wrap = document.getElementById('step_editor');
-  const steps = (STATE.programs[STATE.selected_program] || {steps:[]}).steps || [];
-  wrap.innerHTML = "";
-  if(steps.length===0){
-    wrap.innerHTML = "<div class='hint'>No steps yet. Add a step.</div>";
-    return;
-  }
-  steps.forEach((s, idx)=>{
-    wrap.insertAdjacentHTML('beforeend', `
-      <div class="editorRow">
-        <input id="st_name_${idx}" value="${(s.name||"")}" placeholder="step name"/>
-        <input id="st_slot_${idx}" value="${(s.slot||"")}" placeholder="slot (R1/W5/OVEN)"/>
-        <input id="st_time_${idx}" type="number" value="${(s.time_sec||0)}" placeholder="sec"/>
-        <div class="del" onclick="delStep(${idx})">✕</div>
-      </div>
-    `);
-  });
-}
-
-function addStep(){
-  const prog = STATE.programs[STATE.selected_program];
-  prog.steps = prog.steps || [];
-  prog.steps.push({name:"custom_step", slot:"R1", time_sec:60});
-  renderSteps();
-}
-
-function delStep(idx){
-  const prog = STATE.programs[STATE.selected_program];
-  prog.steps.splice(idx,1);
-  renderSteps();
-}
-
-function collectSteps(){
-  const prog = STATE.programs[STATE.selected_program];
-  const steps = prog.steps || [];
-  const out = [];
-  for(let i=0;i<steps.length;i++){
-    out.push({
-      name: (document.getElementById('st_name_'+i).value||"").trim(),
-      slot: (document.getElementById('st_slot_'+i).value||"").trim(),
-      time_sec: parseInt(document.getElementById('st_time_'+i).value||"0")
-    });
-  }
-  return out;
-}
-
-async function saveProgram(){
-  const steps = collectSteps();
-  const r = await fetch('/api/program/save', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({program: STATE.selected_program, steps: steps})
-  });
-  const data = await r.json();
-  if(data.ok){
-    document.getElementById('msg_right').textContent = "Program saved ✅";
-    await loadState();
-  }else{
-    document.getElementById('msg_right').textContent = "Save failed ❌ " + JSON.stringify(data, null, 2);
-  }
-}
-
-async function saveLayout(){
-  const payload = {layout:{}};
-  ALL.forEach(slot=>{
-    payload.layout[slot] = document.getElementById('sel_'+slot).value;
-  });
-  const r = await fetch('/api/layout/save', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const data = await r.json();
-  if(data.ok){
-    document.getElementById('msg_left').textContent = "Layout saved ✅";
-    await loadState();
-  }else{
-    document.getElementById('msg_left').textContent = "Save failed ❌ " + JSON.stringify(data, null, 2);
-  }
-}
-
-async function check(){
-  const r = await fetch('/api/check', {method:'POST'});
-  const data = await r.json();
-  setBadge(data.overall);
-  let txt = `${data.program} => ${data.overall}\\n`;
-  (data.findings||[]).forEach(f=>{
-    txt += `${f.code} | ${f.level} | ${f.message} | ${JSON.stringify(f.details||{})}\\n`;
-  });
-  if((data.findings||[]).length===0) txt += "No findings.";
-  document.getElementById('msg_left').textContent = txt;
-}
-
-async function upsertReagent(){
-  const id = (document.getElementById('rg_id').value||"").trim().toUpperCase();
-  const name = (document.getElementById('rg_name').value||"").trim();
-  const category = (document.getElementById('rg_cat').value||"OTHER").trim().toUpperCase();
-  const color = (document.getElementById('rg_col').value||"#64748b").trim();
-  if(!id){ alert("Reagent ID required"); return; }
-
-  const r = await fetch('/api/reagents/upsert', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({reagent_id:id, name:name, category:category, color:color})
-  });
-  const data = await r.json();
-  if(data.ok){
-    document.getElementById('msg_right').textContent = "Reagent saved ✅";
-    await loadState();
-  }else{
-    document.getElementById('msg_right').textContent = "Reagent failed ❌ " + JSON.stringify(data, null, 2);
-  }
-}
-
-async function deleteReagent(){
-  const id = (document.getElementById('rg_id').value||"").trim().toUpperCase();
-  if(!id){ alert("Enter Reagent ID"); return; }
-  const r = await fetch('/api/reagents/delete', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({reagent_id:id})
-  });
-  const data = await r.json();
-  if(data.ok){
-    document.getElementById('msg_right').textContent = "Reagent deleted ✅";
-    await loadState();
-  }else{
-    document.getElementById('msg_right').textContent = "Delete failed ❌ " + JSON.stringify(data, null, 2);
-  }
-}
-
-loadState();
-</script>
-
-</body>
-</html>
-"""
-    html = tpl.replace("__TOP__", top_html).replace("__BOTTOM__", bottom_html).replace("__TOPSLOTS__", top_js).replace("__BOTTOMSLOTS__", bottom_js)
-    return HTMLResponse(html)
-
-# Pre-rendered bath HTML (safe)
-def bath_tile(slot: str) -> str:
-    return (
-        f"<div class='tile' id='tile_{slot}'>"
-        f"  <div class='slot'>{slot}</div>"
-        f"  <select class='sel' id='sel_{slot}'></select>"
-        f"</div>"
-    )
-
-top_html = "".join(bath_tile(s) for s in TOP_ROW)
-bottom_html = "".join(bath_tile(s) for s in BOTTOM_ROW)
+@app.post("/api/program/delete")
+def api_program_delete(req: ProgramDeleteReq):
+    name = (req.name or "").strip()
+    if name not in STATE["programs"]:
+        return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
+    if len(STATE["programs"]) <= 1:
+        return JSONResponse({"
